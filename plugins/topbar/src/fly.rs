@@ -1,5 +1,6 @@
-// Own flyouts instead of the stock Windows ones: Start (search + all apps + power), Wi-Fi, volume, battery
-// (+ brightness), calendar. One popup window; what it shows depends on `Kind`.
+// Own flyouts instead of the stock Windows ones: Start (search + all apps + power), the quick panel (network, Bluetooth,
+// volume, brightness, battery), the network panel (Ethernet + Wi-Fi), the sound panel (devices, microphone), calendar.
+// One popup window; what it shows depends on `Kind`.
 use super::*;
 use std::sync::Mutex;
 use std::{
@@ -10,7 +11,8 @@ use std::{
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
     Quick,
-    Wifi,
+    Wifi,  // the network panel: wired connections, then the Wi-Fi list
+    Sound, // outputs, inputs and the microphone
     Cal,
     Start,
     Menu, // right-click menu of the bar
@@ -21,9 +23,16 @@ enum Act {
     VolSlide,
     BrightSlide,
     Mute,
+    SoundMore, // the arrow next to the volume slider: the sound panel
+    OutDev(usize),
+    InDev(usize),
+    MicSlide,
+    MicMute,
+    Mixer,
     WifiSwitch,
     Tile(u8),
     WifiMore,
+    BtMore, // the Bluetooth tile's arrow: its settings page
     Net(usize),
     NetOff, // the connected network's Disconnect button
     Settings(&'static str),
@@ -32,7 +41,74 @@ enum Act {
     CalNext,
     CalToday,
     App(usize), // index into the filtered list
-    Power(u8),  // 0 lock, 1 sleep, 2 restart, 3 shut down
+    Power(u8),  // an index into POWER, or POWER_MENU: the one button that opens them as a menu
+}
+
+/// Start's power actions in the order they are shown; these names are what `start.buttons` in config.txt lists.
+pub const POWER: [&str; 6] = ["lock", "signout", "sleep", "hibernate", "restart", "shutdown"];
+const POWER_GLYPH: [&str; 7] = ["\u{E72E}", "\u{E77B}", "\u{E708}", "\u{E823}", "\u{E777}", "\u{E7E8}", "\u{E7E8}"];
+const POWER_MENU: u8 = 6;
+
+/// "lock, Restart" -> the bits of those actions (unknown names are ignored).
+pub fn power_mask(list: &str) -> u8 {
+    list.split(',').filter_map(|n| POWER.iter().position(|p| p.eq_ignore_ascii_case(n.trim()))).fold(0, |m, i| m | 1 << i)
+}
+
+/// The bits back as the list config.txt holds.
+pub fn power_names(mask: u8) -> String {
+    (0..POWER.len()).filter(|i| mask & 1 << i != 0).map(|i| POWER[i]).collect::<Vec<_>>().join(",")
+}
+
+pub fn power_label(p: u8) -> &'static str {
+    match p {
+        0 => t!("Блокировка", "Lock"),
+        1 => t!("Выход из системы", "Sign out"),
+        2 => t!("Сон", "Sleep"),
+        3 => t!("Гибернация", "Hibernate"),
+        4 => t!("Перезагрузка", "Restart"),
+        5 => t!("Завершение работы", "Shut down"),
+        _ => t!("Питание", "Power"),
+    }
+}
+
+/// The buttons at the bottom of Start, left to right: the chosen actions, or the one menu button.
+fn power_shown() -> Vec<u8> {
+    let c = cfg();
+    match (c.power, c.power_menu) {
+        (0, _) => vec![],
+        (_, true) => vec![POWER_MENU],
+        (m, false) => (0..POWER.len() as u8).filter(|i| m & 1 << i != 0).collect(),
+    }
+}
+
+/// Signing out, restarting and shutting down close the user's work: as buttons they take a second click.
+fn power_confirm(p: u8) -> bool {
+    matches!(p, 1 | 4 | 5)
+}
+
+unsafe fn power(p: u8) {
+    let run = |exe: &str, args: &[&str]| _ = Command::new(exe).args(args).creation_flags(NO_WINDOW).spawn();
+    match p {
+        0 => run("rundll32.exe", &["user32.dll,LockWorkStation"]),
+        1 => run("shutdown", &["/l"]),
+        // not `rundll32 powrprof.dll,SetSuspendState`: rundll32 passes garbage arguments and the PC hibernates
+        // instead of sleeping whenever hibernation is on. On its own thread: the call returns only after wake-up.
+        2 => _ = std::thread::spawn(sleep_now),
+        3 => run("shutdown", &["/h"]),
+        4 => run("shutdown", &["/r", "/t", "0"]),
+        _ => run("shutdown", &["/s", "/t", "0"]),
+    }
+}
+
+/// The power actions as a menu (Start's single power button), centered on screen x `cx`.
+unsafe fn power_menu(cx: i32) {
+    let ids: Vec<u8> = (0..POWER.len() as u8).filter(|i| cfg().power & 1 << i != 0).collect();
+    let items = ids.iter().map(|&p| if power_confirm(p) { MItem::new(power_label(p)).danger() } else { MItem::new(power_label(p)) }).collect();
+    menu(cx, None, items, move |i| {
+        if let Some(&p) = ids.get(i) {
+            power(p);
+        }
+    });
 }
 
 struct Net {
@@ -103,6 +179,9 @@ thread_local! {
     static T0: Cell<u64> = const { Cell::new(0) }; // when it started opening
     static JUST: RefCell<(String, u64)> = const { RefCell::new((String::new(), 0)) }; // the app pinned last and when: its row pulses
     static GHOST: Cell<(HWND, u64, (i32, i32))> = const { Cell::new((null_mut(), 0, (0, 0))) }; // the closing flyout: window, start, position
+    static OUTS: RefCell<Vec<audio::Dev>> = const { RefCell::new(Vec::new()) }; // sound panel: outputs
+    static INS: RefCell<Vec<audio::Dev>> = const { RefCell::new(Vec::new()) }; // ...inputs
+    static MIC: Cell<(i32, bool)> = const { Cell::new((-1, false)) }; // ...the default microphone: (level or -1 = none, muted)
 }
 
 const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
@@ -283,6 +362,94 @@ pub fn start_toggle(path: &str) {
     let _ = std::fs::write(pin_file(), p.join("\n"));
 }
 
+/// What a Start layout exported by Windows pins, in its order: shortcut paths (environment variables as written) and
+/// `shell:AppsFolder\<id>` for apps named by id. Reads both formats of `Export-StartLayout`: the XML of Windows 10
+/// (attributes) and the JSON of Windows 11 (keys).
+fn layout_entries(text: &str) -> Vec<String> {
+    const KEYS: [(&str, bool); 6] = [("DesktopApplicationLinkPath=\"", false), ("DesktopApplicationID=\"", true), ("AppUserModelID=\"", true), ("\"desktopAppLink\":", false), ("\"packagedAppId\":", true), ("\"desktopAppId\":", true)];
+    let mut found: Vec<(usize, String)> = vec![];
+    for (key, is_id) in KEYS {
+        let json = key.ends_with(':');
+        let mut at = 0;
+        while let Some(i) = text[at..].find(key) {
+            let mut v = &text[at + i + key.len()..];
+            at += i + key.len();
+            if json {
+                let Some(q) = v.trim_start().strip_prefix('"') else { continue };
+                v = q;
+            }
+            let Some(end) = v.find('"') else { break };
+            let val = if json { v[..end].replace("\\\\", "\\") } else { v[..end].replace("&amp;", "&") };
+            if !val.is_empty() {
+                found.push((at, if is_id { format!(r"shell:AppsFolder\{val}") } else { val }));
+            }
+        }
+    }
+    found.sort_by_key(|f| f.0);
+    found.into_iter().map(|f| f.1).collect()
+}
+
+/// What the user has pinned in Windows: the Start menu's tiles (as `Export-StartLayout` lists them) and the Quick Launch
+/// shortcuts. Only what can be started from here: shortcuts that exist and apps the Start list knows.
+fn windows_pinned() -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let tmp = std::env::temp_dir().join("winrust-start-layout.xml");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", "Export-StartLayout -Path $env:WR_OUT"]).env("WR_OUT", &tmp).creation_flags(NO_WINDOW).output();
+    if let Ok(b) = std::fs::read(&tmp) {
+        let text = if b.starts_with(&[0xFF, 0xFE]) { String::from_utf16_lossy(&b[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()) } else { String::from_utf8_lossy(&b).to_string() };
+        out.extend(layout_entries(&text).iter().map(|e| expand_env(e)));
+    }
+    let _ = std::fs::remove_file(&tmp);
+    for dir in [r"Microsoft\Internet Explorer\Quick Launch", r"Microsoft\Internet Explorer\Quick Launch\User Pinned\StartMenu"] {
+        let mut links: Vec<_> = std::fs::read_dir(appdata_file(dir)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk"))).collect();
+        links.sort();
+        // Windows' own two (show the desktop, switch windows) are not programs
+        out.extend(links.iter().map(|p| p.to_string_lossy().to_string()).filter(|p| !p.ends_with("Shows Desktop.lnk") && !p.ends_with("Window Switcher.lnk")));
+    }
+    let apps = APPS.lock().unwrap();
+    out.into_iter()
+        .filter_map(|e| match apps.iter().find(|a| wstr(&a.1).eq_ignore_ascii_case(&e)) {
+            Some(a) => Some(wstr(&a.1)), // spelled as the Start list has it
+            None => (!e.starts_with("shell:") && std::path::Path::new(&e).is_file()).then_some(e),
+        })
+        .collect()
+}
+
+/// Adds what Windows has pinned to our Start (what is there stays, nothing twice). On a thread: PowerShell takes a
+/// second; the bar gets IMPORT_DONE with the number added and shows Start.
+pub fn start_import() {
+    let bar = BAR.load(Relaxed);
+    std::thread::spawn(move || {
+        if APPS.lock().unwrap().is_empty() {
+            load_apps();
+        }
+        let found = windows_pinned();
+        pinned_load();
+        let mut p = PINNED.lock().unwrap();
+        let before = p.len();
+        for f in found {
+            if !p.iter().any(|x| x.eq_ignore_ascii_case(&f)) {
+                p.push(f);
+            }
+        }
+        let _ = std::fs::write(pin_file(), p.join("\n"));
+        unsafe { PostMessageW(bar as HWND, IMPORT_DONE, p.len() - before, 0) };
+    });
+}
+
+/// The import finished (on the bar's thread): Start opens and says what it got.
+pub unsafe fn import_done(added: usize) {
+    if !is_open(Kind::Start) {
+        toggle(Kind::Start);
+    }
+    note(&match added {
+        0 => t!("В Windows не закреплено ничего нового", "Nothing new is pinned in Windows").to_string(),
+        n => tf!("Добавлено из Windows: {}", "Added from Windows: {}", n),
+    });
+    InvalidateRect(FH.get(), null(), 0);
+}
+
 static EXE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Programs that have no Start menu shortcut (a loose loliland.exe): asks rust-search for .exe files matching what is typed
@@ -366,6 +533,14 @@ fn set_brightness(v: i32) {
         let c = format!("Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{Timeout=1;Brightness={v}}}");
         let _ = Command::new("powershell").args(["-NoProfile", "-Command", &c]).creation_flags(NO_WINDOW).output();
     });
+}
+
+/// Reads what the sound panel shows: the devices, the microphone, the volume.
+unsafe fn read_sound() {
+    OUTS.set(audio::devices(false));
+    INS.set(audio::devices(true));
+    MIC.set(audio::mic().unwrap_or((-1, false)));
+    read_volume();
 }
 
 /// Runs `f` with an open WLAN handle and the first wifi adapter. None when there is no wifi.
@@ -482,6 +657,7 @@ fn size(k: Kind) -> (i32, i32) {
         Kind::Quick => (360, 196 + if BRIGHT.load(Relaxed) >= 0 { 96 } else { 48 } + 64),
         Kind::Cal => (330, 340),
         Kind::Wifi => (360, wifi_rows().2),
+        Kind::Sound => (360, sound_geo().h),
         Kind::Start => (560, 640),
         Kind::Menu => (MW, menu_rows().1),
     }
@@ -491,7 +667,7 @@ fn size(k: Kind) -> (i32, i32) {
 /// y of the "Other networks" label, and the panel height.
 fn wifi_rows() -> (Vec<(i32, i32)>, Option<i32>, i32) {
     NETS.with_borrow(|n| {
-        let (mut y, mut rows, mut label) = (78, vec![], None);
+        let (mut y, mut rows, mut label) = (78 + ETH_CARD * eth_n(), vec![], None); // the wired connections come first
         for net in n.iter() {
             if net.connected {
                 rows.push((y, y + 130));
@@ -505,8 +681,46 @@ fn wifi_rows() -> (Vec<(i32, i32)>, Option<i32>, i32) {
                 y += 48;
             }
         }
-        (rows, label, y + if n.is_empty() { 84 } else { 8 } + 50)
+        // an empty list leaves room for one line of text, unless a wired connection already says it all
+        (rows, label, y + if !n.is_empty() || (!HAS_WIFI.get() && eth_n() > 0) { 8 } else { 84 } + 50)
     })
+}
+
+const ETH_CARD: i32 = 106; // height of a wired connection's card in the network panel, with the gap under it
+
+/// Wired connections the network panel shows.
+fn eth_n() -> i32 {
+    ETHS.with_borrow(|e| e.len().min(2)) as i32
+}
+
+/// Sound panel rows in logical px: (top, bottom) per output, y of the "Input" label, y of the microphone's slider
+/// (None without a microphone), (top, bottom) per input, and the panel height.
+struct SoundGeo {
+    outs: Vec<(i32, i32)>,
+    in_label: i32,
+    mic: Option<i32>,
+    ins: Vec<(i32, i32)>,
+    h: i32,
+}
+
+fn sound_geo() -> SoundGeo {
+    let (no, ni) = (OUTS.with_borrow(|o| o.len().min(6)), INS.with_borrow(|i| i.len().min(6)));
+    let mut y = 86;
+    let rows = |n: usize, y: &mut i32| -> Vec<(i32, i32)> {
+        let v = (0..n as i32).map(|i| (*y + 38 * i, *y + 38 * (i + 1))).collect();
+        *y += if n == 0 { 30 } else { 38 * n as i32 }; // no devices: one line of text
+        v
+    };
+    let outs = rows(no, &mut y);
+    y += 12;
+    let in_label = y;
+    y += 26;
+    let mic = (ni > 0 && MIC.get().0 >= 0).then(|| {
+        y += 46;
+        y - 46
+    });
+    let ins = rows(ni, &mut y);
+    SoundGeo { outs, in_label, mic, ins, h: y + 10 + 50 }
 }
 
 fn r(l: i32, t: i32, rr: i32, b: i32) -> RECT {
@@ -517,8 +731,15 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
     let (w, h) = size(k);
     match k {
         Kind::Quick => {
-            let mut v = vec![(r(16, 16, 16 + 104 - 36, 72), Act::Tile(0)), (r(16 + 104 - 36, 16, 16 + 104, 72), Act::WifiMore)];
-            v.extend((1..6u8).map(|i| {
+            // the network tile: with Wi-Fi its left part switches the radio and the arrow opens the list; on a PC without
+            // Wi-Fi the whole tile opens the network panel. Bluetooth alike: switch + settings, or just settings without a radio.
+            let mut v = if HAS_WIFI.get() { vec![(r(16, 16, 84, 72), Act::Tile(0)), (r(84, 16, 120, 72), Act::WifiMore)] } else { vec![(r(16, 16, 120, 72), Act::WifiMore)] };
+            if net::BT.load(Relaxed) >= 0 {
+                v.extend([(r(128, 16, 196, 72), Act::Tile(1)), (r(196, 16, 232, 72), Act::BtMore)]);
+            } else {
+                v.push((r(128, 16, 232, 72), Act::BtMore));
+            }
+            v.extend((2..6u8).map(|i| {
                 let (c, rw) = (i as i32 % 3, i as i32 / 3);
                 (r(16 + 112 * c, 16 + 96 * rw, 16 + 112 * c + 104, 72 + 96 * rw), Act::Tile(i))
             }));
@@ -528,8 +749,21 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
                 y += 48;
             }
             v.push((r(16, y, 52, y + 40), Act::Mute));
-            v.push((r(60, y, w - 16, y + 40), Act::VolSlide));
+            v.push((r(60, y, w - 52, y + 40), Act::VolSlide));
+            v.push((r(w - 48, y, w - 12, y + 40), Act::SoundMore));
             v.push((r(w - 52, h - 48, w - 12, h - 8), Act::Settings("ms-settings:")));
+            v
+        }
+        Kind::Sound => {
+            let g = sound_geo();
+            let mut v = vec![(r(16, 40, 52, 80), Act::Mute), (r(60, 40, w - 16, 80), Act::VolSlide)];
+            v.extend(g.outs.iter().enumerate().map(|(i, &(t, b))| (r(12, t, w - 12, b), Act::OutDev(i))));
+            if let Some(m) = g.mic {
+                v.extend([(r(16, m, 52, m + 40), Act::MicMute), (r(60, m, w - 16, m + 40), Act::MicSlide)]);
+            }
+            v.extend(g.ins.iter().enumerate().map(|(i, &(t, b))| (r(12, t, w - 12, b), Act::InDev(i))));
+            v.push((r(12, h - 48, w / 2 + 16, h - 12), Act::Settings("ms-settings:sound")));
+            v.push((r(w / 2 + 20, h - 48, w - 12, h - 12), Act::Mixer));
             v
         }
         Kind::Cal => vec![(r(w - 84, 10, w - 52, 42), Act::CalPrev), (r(w - 48, 10, w - 16, 42), Act::CalNext), (r(16, 10, w - 100, 42), Act::CalToday)],
@@ -540,8 +774,10 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
                 let b = rows[i].1;
                 v.push((r(w - 24 - 116, b - 42, w - 24, b - 12), Act::NetOff));
             }
-            v.push((r(w - 66, 24, w - 18, 48), Act::WifiSwitch));
-            v.push((r(12, h - 48, w - 12, h - 12), Act::Settings("ms-settings:network-wifi")));
+            if HAS_WIFI.get() {
+                v.push((r(w - 66, 24, w - 18, 48), Act::WifiSwitch));
+            }
+            v.push((r(12, h - 48, w - 12, h - 12), Act::Settings(if HAS_WIFI.get() { "ms-settings:network-wifi" } else { "ms-settings:network-ethernet" })));
             v
         }
         Kind::Menu => menu_rows().0.into_iter().enumerate().map(|(i, (t, b))| (r(6, t, w - 6, b), Act::Menu(i as u8))).collect(),
@@ -549,7 +785,9 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
             let f = filtered();
             let s = SCROLL.get();
             let mut v: Vec<_> = (0..ROWS).filter(|i| s + i < f.len()).map(|i| (r(12, 76 + 40 * i as i32, w - 12, 76 + 40 * (i as i32 + 1)), Act::App(s + i))).collect();
-            v.extend((0..4u8).map(|i| (r(w - 16 - 4 * 44 + 44 * i as i32, h - 52, w - 16 - 4 * 44 + 44 * (i as i32 + 1) - 4, h - 12), Act::Power(i))));
+            let pw = power_shown();
+            let px = w - 16 - 44 * pw.len() as i32;
+            v.extend(pw.iter().enumerate().map(|(i, &p)| (r(px + 44 * i as i32, h - 52, px + 44 * (i as i32 + 1) - 4, h - 12), Act::Power(p))));
             v
         }
     }
@@ -575,7 +813,7 @@ pub fn init(hi: HINSTANCE) {
 pub struct MItem {
     pub icon: HICON,
     pub label: String,
-    pub hint: &'static str,
+    pub hint: String,
     pub on: bool,
     pub danger: bool,
     pub sep: bool,
@@ -583,10 +821,10 @@ pub struct MItem {
 
 impl MItem {
     pub fn new(label: impl Into<String>) -> Self {
-        MItem { icon: null_mut(), label: label.into(), hint: "", on: false, danger: false, sep: false }
+        MItem { icon: null_mut(), label: label.into(), hint: String::new(), on: false, danger: false, sep: false }
     }
-    pub fn hint(mut self, h: &'static str) -> Self {
-        self.hint = h;
+    pub fn hint(mut self, h: impl Into<String>) -> Self {
+        self.hint = h.into();
         self
     }
     pub fn on(mut self, on: bool) -> Self {
@@ -644,31 +882,51 @@ fn menu_rows() -> (Vec<(i32, i32)>, i32) {
     (rows, y + 6)
 }
 
-/// Right-click menu of an empty spot of the bar.
-pub fn context_menu(x: i32) {
-    let pu = crate::purge_installed();
-    let mut items = vec![
-        MItem::new(t!("Параметры Windows", "Windows Settings")).hint("Win+I"),
-        MItem::new(t!("Персонализация", "Personalization")),
-        MItem::new(t!("Диспетчер задач", "Task Manager")).hint("Ctrl+Shift+Esc").sep(),
-        MItem::new(t!("Чистильщик диска", "Disk Cleaner")),
-        MItem::new(t!("Программы WinRust на English", "WinRust apps in Русский")), // shared with the other WinRust programs
-        MItem::new(t!("Закрыть панель", "Close the bar")).danger().sep(),
-    ];
-    if pu {
-        items.insert(4, MItem::new(t!("Удалить мусор Windows (необратимо)", "Remove Windows junk (irreversible)")).danger());
+/// Right-click menu of an empty spot of the bar (and of the Start button), centered on screen x `cx`. The bar's own
+/// settings are submenus here: they replace this menu in place.
+pub fn context_menu(cx: i32) {
+    #[derive(Clone, Copy)]
+    enum A {
+        Settings,
+        Personal,
+        Bar,
+        Start,
+        Style,
+        TaskMgr,
+        Cleaner,
+        Purge,
+        Lang,
+        Quit,
     }
-    menu(x, None, items, move |i| unsafe {
-        let i = if pu && i > 4 { i - 1 } else if pu && i == 4 { 99 } else { i };
-        match i {
-            0 => open(&wide("ms-settings:")),
-            1 => open(&wide("ms-settings:personalization")),
+    let mut items = vec![
+        (MItem::new(t!("Параметры Windows", "Windows Settings")).hint("Win+I"), A::Settings),
+        (MItem::new(t!("Персонализация", "Personalization")), A::Personal),
+        (MItem::new(t!("Настройки панели", "Bar settings")).hint("›").sep(), A::Bar),
+        (MItem::new(t!("Меню «Пуск»", "Start menu")).hint("›"), A::Start),
+        (MItem::new(t!("Стиль", "Style")).hint("›"), A::Style),
+        (MItem::new(t!("Диспетчер задач", "Task Manager")).hint("Ctrl+Shift+Esc").sep(), A::TaskMgr),
+        (MItem::new(t!("Чистильщик диска", "Disk Cleaner")), A::Cleaner),
+    ];
+    if crate::purge_installed() {
+        items.push((MItem::new(t!("Удалить мусор Windows (необратимо)", "Remove Windows junk (irreversible)")).danger(), A::Purge));
+    }
+    items.push((MItem::new(t!("Программы WinRust на English", "WinRust apps in Русский")), A::Lang)); // shared with the other WinRust programs
+    items.push((MItem::new(t!("Закрыть панель", "Close the bar")).danger().sep(), A::Quit));
+    let acts: Vec<A> = items.iter().map(|x| x.1).collect();
+    menu(cx, None, items.into_iter().map(|x| x.0).collect(), move |i| unsafe {
+        match acts.get(i).copied() {
+            Some(A::Settings) => open(&wide("ms-settings:")),
+            Some(A::Personal) => open(&wide("ms-settings:personalization")),
+            Some(A::Bar) => crate::settings_menu(cx),
+            Some(A::Start) => crate::start_menu(cx),
+            Some(A::Style) => crate::style_menu(cx),
             // with rtaskmgr-win32 installed this is our task manager; a full path because explorer.exe does not search PATH
-            2 => open(&wide(&format!(r"{}\System32\taskmgr.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())))),
-            3 => open_cleaner(),
-            99 => crate::open_purge(),
-            4 => crate::i18n::set_english(!crate::i18n::english()),
-            _ => _ = PostMessageW(FindWindowW(wide("topbar").as_ptr(), null()), WM_CLOSE, 0, 0), // quits the bar, brings the Windows taskbar back
+            Some(A::TaskMgr) => open(&wide(&format!(r"{}\System32\taskmgr.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())))),
+            Some(A::Cleaner) => open_cleaner(),
+            Some(A::Purge) => crate::open_purge(),
+            Some(A::Lang) => crate::i18n::set_english(!crate::i18n::english()),
+            Some(A::Quit) => _ = PostMessageW(FindWindowW(wide("topbar").as_ptr(), null()), WM_CLOSE, 0, 0), // quits the bar, brings the Windows taskbar back
+            None => {}
         }
     });
 }
@@ -683,6 +941,7 @@ pub fn close() {
     if h.is_null() {
         return;
     }
+    unsafe { ShowWindow(TIPWND.get(), SW_HIDE) }; // a button's tooltip goes with its panel
     unsafe {
         kill_ghost();
         GHOST.set((h, now_ms(), FIN.get()));
@@ -756,10 +1015,16 @@ pub fn toggle(k: Kind) {
             Kind::Wifi => {
                 with_wlan(|h, g| WlanScan(h, g, null(), null(), null()));
                 read_nets();
+                read_wifi(); // also the wired connections
             }
             Kind::Quick => {
                 read_brightness();
                 read_nets();
+                read_wifi();
+            }
+            Kind::Sound => {
+                audio::reset();
+                read_sound();
             }
             Kind::Start => {
                 pinned_load(); // the search card (rs-launcher) can add to this list from another process
@@ -794,6 +1059,9 @@ pub fn toggle(k: Kind) {
         force_fg(hw);
         SetTimer(hw, 1, 1000, None);
         SetTimer(hw, 3, 15, None);
+        if k == Kind::Quick {
+            net::bt_read(hw as isize); // the Bluetooth tile fills in when the radio has answered
+        }
     }
 }
 
@@ -801,10 +1069,13 @@ pub fn toggle(k: Kind) {
 
 unsafe fn slide(a: Act, x: i32, rect: RECT) {
     let f = ((x - rect.left - sc(8)) as f32 / (rect.right - rect.left - sc(16)) as f32).clamp(0.0, 1.0);
-    if a == Act::VolSlide {
-        set_volume((f * 100.0).round() as i32);
-    } else {
-        BRIGHT.store(((f * 100.0) as i32).max(1), Relaxed);
+    match a {
+        Act::VolSlide => set_volume((f * 100.0).round() as i32),
+        Act::MicSlide => {
+            audio::set_mic((f * 100.0).round() as i32);
+            MIC.set(((f * 100.0).round() as i32, false));
+        }
+        _ => BRIGHT.store(((f * 100.0) as i32).max(1), Relaxed),
     }
 }
 
@@ -861,15 +1132,44 @@ unsafe fn app_menu(hw: HWND, i: usize, x: i32, y: i32) {
 
 unsafe fn run_act(a: Act, rect: RECT, x: i32) {
     match a {
-        Act::VolSlide | Act::BrightSlide => {
-            DRAG.set(if a == Act::VolSlide { 1 } else { 2 });
+        Act::VolSlide | Act::BrightSlide | Act::MicSlide => {
+            DRAG.set(match a {
+                Act::VolSlide => 1,
+                Act::BrightSlide => 2,
+                _ => 3,
+            });
             SetCapture(FH.get());
             slide(a, x, rect);
         }
         Act::WifiMore => toggle(Kind::Wifi),
+        Act::SoundMore => toggle(Kind::Sound),
+        Act::OutDev(i) | Act::InDev(i) => {
+            let id = if matches!(a, Act::OutDev(_)) { &OUTS } else { &INS }.with_borrow(|d| d.get(i).filter(|d| !d.default).map(|d| d.id.clone()));
+            if let Some(id) = id {
+                if audio::set_default(&id) {
+                    EP.set(None); // the bar's volume now belongs to the new device
+                } else {
+                    NOTE.set(t!("Windows не дала сменить устройство", "Windows would not switch the device").into());
+                }
+                read_sound();
+            }
+        }
+        Act::MicMute => {
+            audio::toggle_mic();
+            MIC.set(audio::mic().unwrap_or((-1, false)));
+        }
+        Act::Mixer => {
+            open(&wide(&format!(r"{}\System32\SndVol.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))));
+            close();
+        }
+        Act::BtMore => {
+            open(&wide("ms-settings:bluetooth"));
+            close();
+        }
         Act::WifiSwitch => wifi_radio(WIFI.get() < 0 && NETS.with_borrow(|n| n.is_empty())),
         Act::Tile(i) => match i {
             0 => wifi_radio(WIFI.get() < 0),
+            1 => net::bt_set(net::BT.load(Relaxed) != 1, FH.get() as isize),
             5 => {
                 close();
                 keys(&[VK_LWIN, VK_CONTROL, b'L' as u16]); // live captions
@@ -927,28 +1227,18 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
                 close();
             }
         }
+        Act::Power(POWER_MENU) => {
+            let cx = FIN.get().0 + (rect.left + rect.right) / 2;
+            close();
+            power_menu(cx);
+        }
         Act::Power(p) => {
-            if p >= 2 && CONFIRM.get() != p as i32 {
+            if power_confirm(p) && CONFIRM.get() != p as i32 {
                 CONFIRM.set(p as i32); // first click only arms it
                 return;
             }
             close();
-            match p {
-                0 => {
-                    let _ = Command::new("rundll32.exe").args(["user32.dll,LockWorkStation"]).creation_flags(NO_WINDOW).spawn();
-                }
-                1 => {
-                    // not `rundll32 powrprof.dll,SetSuspendState`: rundll32 passes garbage arguments and the PC hibernates
-                    // instead of sleeping whenever hibernation is on. On its own thread: the call returns only after wake-up.
-                    std::thread::spawn(|| sleep_now());
-                }
-                2 => {
-                    let _ = Command::new("shutdown").args(["/r", "/t", "0"]).creation_flags(NO_WINDOW).spawn();
-                }
-                _ => {
-                    let _ = Command::new("shutdown").args(["/s", "/t", "0"]).creation_flags(NO_WINDOW).spawn();
-                }
-            }
+            power(p);
         }
     }
 }
@@ -1009,31 +1299,56 @@ unsafe fn paint(hw: HWND, k: Kind) {
     match k {
         Kind::Quick => {
             let rs = rects(k);
-            let ssid = NETS.with_borrow(|n| n.iter().find(|n| n.connected).map(|n| n.ssid.clone()));
-            let tiles = [("\u{E701}", ssid.unwrap_or("Wi‑Fi".into())), ("\u{E702}", "Bluetooth".into()), ("\u{E709}", "Airplane mode".into()), ("\u{E776}", "Accessibility".into()), ("\u{E945}", "Energy saver".into()), ("\u{E7F0}", "Live captions".into())];
-            for (i, (glyph, label)) in tiles.iter().enumerate() {
+            let (state, wifi, bt) = (net(), HAS_WIFI.get(), net::BT.load(Relaxed));
+            // the network tile: the Wi-Fi network, or on a PC without Wi-Fi the cable's state
+            let (net_label, net_on) = if wifi {
+                (NETS.with_borrow(|n| n.iter().find(|n| n.connected).map(|n| n.ssid.clone())).unwrap_or("Wi‑Fi".into()), WIFI.get() >= 0)
+            } else {
+                match state {
+                    Link::Cable => (ETHS.with_borrow(|e| e.first().map(|e| e.name.clone())).unwrap_or(t!("Сеть", "Network").into()), true),
+                    Link::CableNoInternet => (t!("Нет интернета", "No internet").into(), true),
+                    _ => (t!("Не подключено", "Not connected").to_string(), false),
+                }
+            };
+            // Bluetooth: what is connected, when something is
+            let bt_label = match net::BT_DEVS.lock().unwrap().as_slice() {
+                [] => "Bluetooth".to_string(),
+                [one] => one.clone(),
+                [first, rest @ ..] => format!("{first} +{}", rest.len()),
+            };
+            // (glyph, label, lit, has an arrow part)
+            let tiles = [("", net_label, net_on, wifi), ("\u{E702}", bt_label, bt == 1, bt >= 0), ("\u{E709}", "Airplane mode".into(), false, false), ("\u{E776}", "Accessibility".into(), false, false), ("\u{E945}", "Energy saver".into(), false, false), ("\u{E7F0}", "Live captions".into(), false, false)];
+            for (i, (glyph, label, on, split)) in tiles.iter().enumerate() {
+                let (on, split) = (*on, *split);
                 let c = (i % 3) as i32;
                 let (tl, tt) = (16 + 112 * c, 16 + 96 * (i as i32 / 3));
-                let on = i == 0 && WIFI.get() >= 0;
                 let full = r(tl, tt, tl + 104, tt + 56);
+                let (base, ink) = (if on { pal().accent } else { mix(pal().bg, pal().line, 0.5) }, if on { pal().bg } else { pal().text });
                 fill(dc, full, if on { pal().accent } else { pal().line }, sc(8));
-                fill(dc, RECT { left: full.left + 1, top: full.top + 1, right: full.right - 1, bottom: full.bottom - 1 }, if on { pal().accent } else { mix(pal().bg, pal().line, 0.5) }, sc(8));
-                for (rc, a) in rs.iter().filter(|(_, a)| matches!(a, Act::Tile(j) if *j as usize == i) || (i == 0 && *a == Act::WifiMore)) {
-                    g(*a, *rc, if on { pal().accent } else { mix(pal().bg, pal().line, 0.5) }, if on { mix(pal().accent, pal().text, 0.3) } else { pal().hover }, sc(8));
+                fill(dc, RECT { left: full.left + 1, top: full.top + 1, right: full.right - 1, bottom: full.bottom - 1 }, base, sc(8));
+                for (rc, a) in rs.iter().filter(|(rc, _)| rc.top == full.top && rc.bottom == full.bottom && rc.left >= full.left && rc.right <= full.right) {
+                    g(*a, *rc, base, if on { mix(pal().accent, pal().text, 0.3) } else { pal().hover }, sc(8));
                 }
-                SelectObject(dc, f_glyph);
-                let gr = if i == 0 { r(tl, tt, tl + 68, tt + 56) } else { full };
-                if i == 0 {
+                let gr = if split { r(tl, tt, tl + 68, tt + 56) } else { full };
+                let (gx, gy) = ((gr.left + gr.right) / 2, (gr.top + gr.bottom) / 2);
+                if i == 0 && wifi {
                     // the same arcs as the bar: lit by the signal, a cross when not connected
-                    let c = if on { pal().bg } else { pal().text };
                     let q = WIFI.get();
-                    wifi_glyph(dc, (gr.left + gr.right) / 2, (gr.top + gr.bottom) / 2, sc(20), if q >= 0 { arcs_lit(q) } else { 0 }, c, mix(c, if on { pal().accent } else { pal().bg }, 0.55), if q < 0 { 1 } else { 0 });
+                    wifi_glyph(dc, gx, gy, sc(20), if q >= 0 { arcs_lit(q) } else { 0 }, ink, mix(ink, base, 0.55), if q < 0 { 1 } else { 0 });
+                } else if i == 0 {
+                    eth_glyph(dc, gx, gy, sc(20), f_glyph, ink, ink, match state {
+                        Link::Cable => 0,
+                        Link::CableNoInternet => 2,
+                        _ => 1,
+                    });
                 } else {
-                    text(dc, glyph, gr, if on { pal().bg } else { pal().text }, DT_CENTER);
+                    SelectObject(dc, f_glyph);
+                    text(dc, glyph, gr, ink, DT_CENTER);
                 }
-                if i == 0 {
+                if split {
                     fill(dc, r(tl + 68, tt + 12, tl + 69, tt + 44), if on { pal().bg } else { pal().line }, 0);
-                    text(dc, "\u{E76C}", r(tl + 68, tt, tl + 104, tt + 56), if on { pal().bg } else { pal().text }, DT_CENTER);
+                    SelectObject(dc, f_glyph);
+                    text(dc, "\u{E76C}", r(tl + 68, tt, tl + 104, tt + 56), ink, DT_CENTER);
                 }
                 SelectObject(dc, f_small);
                 text(dc, label, r(tl, tt + 60, tl + 104, tt + 82), pal().text, DT_CENTER);
@@ -1050,6 +1365,10 @@ unsafe fn paint(hw: HWND, k: Kind) {
             SelectObject(dc, f_glyph);
             text(dc, if muted || vol == 0 { "\u{E74F}" } else { "\u{E767}" }, r(16, y, 52, y + 40), pal().text, DT_CENTER);
             track(dc, rs.iter().find(|(_, a)| *a == Act::VolSlide).unwrap().0, if muted { 0.0 } else { vol.max(0) as f32 / 100.0 });
+            // the arrow: which device plays, and the microphone
+            g(Act::SoundMore, r(w - 48, y, w - 12, y + 40), pal().bg, pal().hover, sc(8));
+            SelectObject(dc, f_glyph);
+            text(dc, "\u{E76C}", r(w - 48, y, w - 12, y + 40), pal().text, DT_CENTER);
             fill(dc, r(0, h - 56, w, h - 55), pal().line, 0);
             let (pct, ac) = BAT.get();
             SelectObject(dc, f_glyph);
@@ -1061,6 +1380,63 @@ unsafe fn paint(hw: HWND, k: Kind) {
             g(Act::Settings("ms-settings:"), r(w - 52, h - 48, w - 12, h - 8), pal().bg, pal().hover, sc(8));
             SelectObject(dc, f_glyph);
             text(dc, "\u{E713}", r(w - 52, h - 48, w - 12, h - 8), pal().text, DT_CENTER);
+        }
+        Kind::Sound => {
+            let (rs, geo) = (rects(k), sound_geo());
+            let find = |a: Act| rs.iter().find(|(_, x)| *x == a).map(|x| x.0);
+            let label = |s: &str, y: i32| {
+                SelectObject(dc, f_small);
+                text(dc, s, r(18, y, w - 16, y + 22), pal().dim, DT_LEFT);
+            };
+            // one device row: a check mark and brighter text for the one in use
+            let row = |a: Act, d: &audio::Dev| {
+                let Some(rc) = find(a) else { return };
+                g(a, rc, pal().bg, pal().hover, sc(8));
+                if d.default {
+                    SelectObject(dc, f_glyph);
+                    text(dc, "\u{E73E}", RECT { left: rc.left + sc(6), right: rc.left + sc(34), ..rc }, pal().accent, DT_CENTER);
+                }
+                SelectObject(dc, f_txt);
+                text(dc, &d.name, RECT { left: rc.left + sc(40), right: rc.right - sc(10), ..rc }, if d.default { pal().text } else { mix(pal().dim, pal().text, 0.55) }, DT_LEFT);
+            };
+            label(t!("Вывод", "Output"), 14);
+            g(Act::Mute, r(16, 40, 52, 80), pal().bg, pal().hover, sc(8));
+            SelectObject(dc, f_glyph);
+            text(dc, if muted || vol == 0 { "\u{E74F}" } else { "\u{E767}" }, r(16, 40, 52, 80), if muted { BAD } else { pal().text }, DT_CENTER);
+            track(dc, r(60, 40, w - 16, 80), if muted { 0.0 } else { vol.max(0) as f32 / 100.0 });
+            OUTS.with_borrow(|o| {
+                o.iter().take(6).enumerate().for_each(|(i, d)| row(Act::OutDev(i), d));
+                if o.is_empty() {
+                    SelectObject(dc, f_txt);
+                    text(dc, t!("Нет устройств вывода", "No output devices"), r(18, 86, w - 16, 116), pal().dim, DT_LEFT);
+                }
+            });
+            fill(dc, r(16, geo.in_label - 6, w - 16, geo.in_label - 5), pal().line, 0);
+            label(t!("Ввод", "Input"), geo.in_label);
+            if let Some(m) = geo.mic {
+                let (lvl, off) = MIC.get();
+                g(Act::MicMute, r(16, m, 52, m + 40), pal().bg, pal().hover, sc(8));
+                SelectObject(dc, f_glyph);
+                text(dc, "\u{E720}", r(16, m, 52, m + 40), if off { BAD } else { pal().text }, DT_CENTER);
+                track(dc, r(60, m, w - 16, m + 40), if off { 0.0 } else { lvl.max(0) as f32 / 100.0 });
+            }
+            INS.with_borrow(|v| {
+                v.iter().take(6).enumerate().for_each(|(i, d)| row(Act::InDev(i), d));
+                if v.is_empty() {
+                    SelectObject(dc, f_txt);
+                    text(dc, t!("Нет микрофона", "No microphone"), r(18, geo.in_label + 26, w - 16, geo.in_label + 56), pal().dim, DT_LEFT);
+                }
+            });
+            fill(dc, r(0, h - 56, w, h - 55), pal().line, 0);
+            let note = NOTE.with_borrow(|n| n.clone());
+            for (a, words) in [(Act::Settings("ms-settings:sound"), t!("Параметры звука", "Sound settings")), (Act::Mixer, t!("Микшер громкости", "Volume mixer"))] {
+                let Some(rc) = find(a) else { continue };
+                g(a, rc, pal().bg, pal().hover, sc(8));
+                SelectObject(dc, f_txt);
+                // a refused device switch is said where the eye is, in place of the first link
+                let failed = !note.is_empty() && a != Act::Mixer;
+                text(dc, if failed { &note } else { words }, RECT { left: rc.left + sc(10), ..rc }, if failed { WARN } else { pal().accent }, DT_LEFT);
+            }
         }
         Kind::Cal => {
             let (y, m) = CAL.get();
@@ -1098,9 +1474,10 @@ unsafe fn paint(hw: HWND, k: Kind) {
             let on = NETS.with_borrow(|n| !n.is_empty()) || WIFI.get() >= 0;
             let state = net();
             // header: the live network icon, the title and one line of plain status
+            let wifi = HAS_WIFI.get(); // a PC without Wi-Fi gets a network panel about its cable, with no radio switch
             net_icon(dc, sc(34), sc(40), sc(26), f_glyph);
             SelectObject(dc, f_title);
-            text(dc, "Wi‑Fi", r(64, 18, w - 90, 40), pal().text, DT_LEFT);
+            text(dc, if wifi { "Wi‑Fi" } else { t!("Сеть", "Network") }, r(64, 18, w - 90, 40), pal().text, DT_LEFT);
             let note = NOTE.with_borrow(|n| n.clone());
             let (sub, sub_col) = if !note.is_empty() {
                 (note, pal().dim)
@@ -1108,7 +1485,10 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 match state {
                     Link::Wifi(_) => (t!("Подключено · интернет есть", "Connected · online").to_string(), GOOD),
                     Link::NoInternet(_) => (t!("Подключено, но интернета нет", "Connected, no internet").into(), WARN),
-                    Link::Cable => (t!("Интернет по кабелю", "Online over a cable").into(), pal().dim),
+                    Link::Cable if eth_n() > 0 => (t!("Подключено по Ethernet · интернет есть", "Connected via Ethernet · online").into(), GOOD),
+                    Link::Cable => (t!("Интернет есть", "Online").into(), GOOD), // not Wi-Fi and no cable we can name (a phone's USB link, a virtual adapter)
+                    Link::CableNoInternet => (t!("Ethernet подключён, но интернета нет", "Ethernet connected, no internet").into(), WARN),
+                    Link::Offline if !wifi => (t!("Сетевой кабель не подключён", "Network cable unplugged").into(), pal().dim),
                     Link::Offline if on => (t!("Не подключено", "Not connected").into(), pal().dim),
                     Link::Offline => (t!("Выключен", "Turned off").into(), pal().dim),
                 }
@@ -1116,11 +1496,13 @@ unsafe fn paint(hw: HWND, k: Kind) {
             SelectObject(dc, f_small);
             text(dc, &sub, r(64, 40, w - 90, 60), sub_col, DT_LEFT);
             // on/off switch: the knob glides, the track fades to the accent
-            let sw = r(w - 66, 24, w - 18, 48);
-            let ts = ease(hv(1_500_000, on));
-            fill(dc, sw, mix(mix(pal().line, pal().dim, 0.25), pal().accent, ts), sc(24));
-            let kx = sw.left + sc(12) + ((sw.right - sw.left - sc(24)) as f32 * ts) as i32;
-            fill(dc, RECT { left: kx - sc(8), top: sw.top + sc(4), right: kx + sc(8), bottom: sw.bottom - sc(4) }, mix(pal().text, pal().bg, ts), sc(16));
+            if wifi {
+                let sw = r(w - 66, 24, w - 18, 48);
+                let ts = ease(hv(1_500_000, on));
+                fill(dc, sw, mix(mix(pal().line, pal().dim, 0.25), pal().accent, ts), sc(24));
+                let kx = sw.left + sc(12) + ((sw.right - sw.left - sc(24)) as f32 * ts) as i32;
+                fill(dc, RECT { left: kx - sc(8), top: sw.top + sc(4), right: kx + sc(8), bottom: sw.bottom - sc(4) }, mix(pal().text, pal().bg, ts), sc(16));
+            }
             fill(dc, r(16, 68, w - 16, 69), pal().line, 0);
             let rs = rects(k);
             let pass = PASS.with_borrow(|p| p.clone());
@@ -1147,10 +1529,32 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 let (_, label, _) = wifi_rows();
                 let conn = CONN.with_borrow(|c| c.as_ref().map(|c| (c.q, c.rx, c.tx, c.phy)));
                 let age = now_ms().saturating_sub(T0.get()) as f32;
+                // wired connections first: a card each with the link's speed, the address and the adapter
+                ETHS.with_borrow(|eths| {
+                    for (i, e) in eths.iter().take(2).enumerate() {
+                        let top = 78 + ETH_CARD * i as i32;
+                        let rc = r(12, top, w - 12, top + ETH_CARD - 8);
+                        let card = mix(pal().bg, pal().active, 0.85);
+                        fill(dc, rc, card, sc(12));
+                        let online = INET.get();
+                        eth_glyph(dc, rc.left + sc(30), rc.top + sc(32), sc(20), f_glyph, pal().accent, pal().text, if online { 0 } else { 2 });
+                        SelectObject(dc, f_title);
+                        text(dc, &e.name, RECT { left: rc.left + sc(60), top: rc.top + sc(12), right: rc.right - sc(14), bottom: rc.top + sc(36) }, pal().text, DT_LEFT);
+                        let (dot, words) = if online { (GOOD, t!("Подключено · интернет есть", "Connected · online")) } else { (WARN, t!("Подключено · нет интернета", "Connected · no internet")) };
+                        let dy = rc.top + sc(46);
+                        fill(dc, RECT { left: rc.left + sc(60), top: dy - sc(3), right: rc.left + sc(66), bottom: dy + sc(3) }, dot, sc(6));
+                        SelectObject(dc, f_small);
+                        text(dc, words, RECT { left: rc.left + sc(72), top: dy - sc(10), right: rc.right - sc(14), bottom: dy + sc(10) }, dot, DT_LEFT);
+                        let det = [net::speed_text(e.bps), e.ip.clone(), e.desc.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+                        text(dc, &det, RECT { left: rc.left + sc(60), top: rc.top + sc(58), right: rc.right - sc(14), bottom: rc.top + sc(76) }, pal().dim, DT_LEFT);
+                    }
+                });
                 NETS.with_borrow(|nets| {
-                    if nets.is_empty() {
+                    if nets.is_empty() && (wifi || eth_n() == 0) {
                         SelectObject(dc, f_txt);
-                        text(dc, if on { t!("Рядом нет сетей", "No networks nearby") } else { t!("Включите Wi‑Fi, чтобы увидеть сети", "Turn Wi‑Fi on to see networks") }, r(18, 86, w - 18, 130), pal().dim, DT_LEFT);
+                        let words = if !wifi { t!("Подключите сетевой кабель", "Plug in a network cable") } else if on { t!("Рядом нет сетей", "No networks nearby") } else { t!("Включите Wi‑Fi, чтобы увидеть сети", "Turn Wi‑Fi on to see networks") };
+                        let top = 86 + ETH_CARD * eth_n();
+                        text(dc, words, r(18, top, w - 18, top + 44), pal().dim, DT_LEFT);
                     }
                     if let Some(ly) = label {
                         SelectObject(dc, f_small);
@@ -1261,7 +1665,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     }
                     SelectObject(dc, f_small);
                     if !it.hint.is_empty() {
-                        text(dc, it.hint, RECT { left: lx, right: rx, ..*rc }, mix(pal().dim, pal().bg, 0.25), DT_RIGHT);
+                        text(dc, &it.hint, RECT { left: lx, right: rx, ..*rc }, mix(pal().dim, pal().bg, 0.25), DT_RIGHT);
                     }
                     SelectObject(dc, f_txt);
                     text(dc, &it.label, RECT { left: lx, right: rx - if it.hint.is_empty() { 0 } else { sc(96) }, ..*rc }, if it.on { pal().accent } else { col }, DT_LEFT);
@@ -1285,6 +1689,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                     text(dc, "Nothing here yet", r(24, 76, w - 24, 106), pal().text, DT_LEFT);
                     text(dc, "Drag an app or file onto the Start button to add it", r(24, 106, w - 24, 134), pal().dim, DT_LEFT);
                     text(dc, "Or search an app and right-click it → Add to Start", r(24, 134, w - 24, 162), pal().dim, DT_LEFT);
+                    text(dc, t!("Или правый клик по панели → Меню «Пуск» → импорт из Windows", "Or right-click the bar → Start menu → import what Windows has pinned"), r(24, 162, w - 24, 190), pal().dim, DT_LEFT);
                 } else {
                     text(dc, "No apps found", r(24, 76, w - 24, 116), pal().dim, DT_LEFT);
                 }
@@ -1330,7 +1735,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                         let armed = CONFIRM.get() == p as i32;
                         glow(dc, rc.top * 4096 + rc.left + 1_000_000, armed || hot(*a), *rc, pal().bg, if armed { BAD } else { pal().hover }, sc(8));
                         SelectObject(dc, f_glyph);
-                        text(dc, ["\u{E72E}", "\u{E708}", "\u{E777}", "\u{E7E8}"][p as usize], *rc, pal().text, DT_CENTER);
+                        text(dc, POWER_GLYPH[(p as usize).min(6)], *rc, pal().text, DT_CENTER);
                     }
                     _ => {}
                 }
@@ -1338,12 +1743,13 @@ unsafe fn paint(hw: HWND, k: Kind) {
             SelectObject(dc, f_small);
             let note = NOTE.with_borrow(|n| n.clone());
             let hint = match CONFIRM.get() {
-                2 => "Click again to restart".to_string(),
-                3 => "Click again to shut down".to_string(),
+                1 => t!("Нажмите ещё раз, чтобы выйти из системы", "Click again to sign out").to_string(),
+                4 => t!("Нажмите ещё раз для перезагрузки", "Click again to restart").to_string(),
+                5 => t!("Нажмите ещё раз для выключения", "Click again to shut down").to_string(),
                 _ if !note.is_empty() => note,
                 _ => std::env::var("USERNAME").unwrap_or_default(),
             };
-            text(dc, &hint, r(24, h - 52, w - 200, h - 12), pal().dim, DT_LEFT);
+            text(dc, &hint, r(24, h - 52, w - 24 - 44 * power_shown().len() as i32, h - 12), pal().dim, DT_LEFT);
         }
     }
 
@@ -1399,9 +1805,30 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         WM_TIMER if wp == 2 => {
             InvalidateRect(hw, null(), 0);
         }
+        WM_TIMER if wp == 7 => {
+            // the pointer rested on one of Start's power buttons: say what it does
+            KillTimer(hw, 7);
+            if let Some((rc, Act::Power(p))) = OVER.get().and_then(|o| rects(k).into_iter().find(|x| x.1 == o)) {
+                let (x, y) = FIN.get();
+                show_tip_at(format!("{}{}", power_label(p), if p == 0 { " (Win+L)" } else { "" }), x + (rc.left + rc.right) / 2, Some(y + rc.top));
+            }
+        }
+        WM_MOUSELEAVE => {
+            KillTimer(hw, 7);
+            ShowWindow(TIPWND.get(), SW_HIDE);
+            if OVER.replace(None).is_some() {
+                InvalidateRect(hw, null(), 0); // no highlight stays behind under a pointer that left
+            }
+        }
         WM_TIMER => {
-            if k == Kind::Wifi && PASS.with_borrow(|p| p.is_none()) {
-                read_nets();
+            if (k == Kind::Wifi && PASS.with_borrow(|p| p.is_none())) || (k == Kind::Sound && DRAG.get() == 0) {
+                // what is listed may have changed (a network appeared, a headset was plugged in): the panel follows
+                if k == Kind::Wifi {
+                    read_nets();
+                    read_wifi();
+                } else {
+                    read_sound();
+                }
                 let (w, h) = (sc(size(k).0), sc(size(k).1));
                 // the panel hangs above the bar: keep its bottom edge where it is and grow / shrink upward
                 let (x, _) = FIN.get();
@@ -1414,17 +1841,31 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         }
         WM_MOUSEMOVE => {
             if DRAG.get() != 0 {
-                let want = if DRAG.get() == 1 { Act::VolSlide } else { Act::BrightSlide };
+                let want = match DRAG.get() {
+                    1 => Act::VolSlide,
+                    2 => Act::BrightSlide,
+                    _ => Act::MicSlide,
+                };
                 if let Some((rc, a)) = rects(k).into_iter().find(|(_, a)| *a == want) {
                     slide(a, x, rc);
                 }
             }
+            let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hw, dwHoverTime: 0 };
+            TrackMouseEvent(&mut tme);
             let o = act_at(k, x, y).map(|a| a.1);
-            if OVER.replace(o) != o || DRAG.get() != 0 {
+            let was = OVER.replace(o);
+            if was != o {
+                // Start's power buttons are bare icons: a tooltip names the one the pointer rests on
+                ShowWindow(TIPWND.get(), SW_HIDE);
+                if matches!(o, Some(Act::Power(_))) { SetTimer(hw, 7, 450, None) } else { KillTimer(hw, 7) as usize };
+            }
+            if was != o || DRAG.get() != 0 {
                 InvalidateRect(hw, null(), 0);
             }
         }
         WM_LBUTTONDOWN => {
+            KillTimer(hw, 7);
+            ShowWindow(TIPWND.get(), SW_HIDE);
             if let Some((rc, a)) = act_at(k, x, y) {
                 run_act(a, rc, x);
             }
@@ -1450,7 +1891,7 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         WM_MOUSEWHEEL => {
             let up = (wp >> 16) as i16 > 0;
             match k {
-                Kind::Quick => add_volume(if up { 2 } else { -2 }),
+                Kind::Quick | Kind::Sound => add_volume(if up { 2 } else { -2 }),
                 Kind::Start => SCROLL.set(if up { SCROLL.get().saturating_sub(2) } else { (SCROLL.get() + 2).min(filtered().len().saturating_sub(ROWS)) }),
                 _ => {}
             }
@@ -1520,7 +1961,25 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
 
 #[cfg(test)]
 mod tests {
-    use super::{flip_layout, score};
+    use super::{flip_layout, layout_entries, power_mask, power_names, score};
+
+    #[test]
+    fn start_buttons_from_the_config_list() {
+        assert_eq!(power_mask("lock,sleep,restart,shutdown"), 0b110101);
+        assert_eq!(power_mask(" Lock , SHUTDOWN, nonsense"), 0b100001);
+        assert_eq!(power_mask(""), 0);
+        assert_eq!(power_names(0b110101), "lock,sleep,restart,shutdown");
+        assert_eq!(power_mask(&power_names(0b111111)), 0b111111);
+    }
+
+    #[test]
+    fn windows_start_layout_in_both_formats() {
+        let xml = r#"<start:Group Name="Work"><start:DesktopApplicationTile Size="2x2" Column="0" Row="0" DesktopApplicationLinkPath="%APPDATA%\Microsoft\Windows\Start Menu\Programs\A &amp; B.lnk" /><start:Tile Size="2x2" AppUserModelID="Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" /><start:DesktopApplicationTile DesktopApplicationID="Microsoft.Windows.Explorer" /></start:Group>"#;
+        assert_eq!(layout_entries(xml), [r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\A & B.lnk", r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", r"shell:AppsFolder\Microsoft.Windows.Explorer"]);
+        let json = r#"{"pinnedList":[{"packagedAppId":"Microsoft.WindowsStore_8wekyb3d8bbwe!App"},{"desktopAppLink": "%ALLUSERSPROFILE%\\Microsoft\\Windows\\Start Menu\\Programs\\Word.lnk"},{"desktopAppId":"MSEdge"}]}"#;
+        assert_eq!(layout_entries(json), [r"shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App", r"%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Word.lnk", r"shell:AppsFolder\MSEdge"]);
+        assert!(layout_entries("<LayoutModificationTemplate />").is_empty());
+    }
 
     #[test]
     fn layout_flip_both_ways() {

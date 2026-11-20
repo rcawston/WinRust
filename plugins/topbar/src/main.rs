@@ -13,13 +13,16 @@ use std::{
     thread,
     sync::Mutex,
     collections::HashMap,
-    sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed},
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::Relaxed},
 };
 #[macro_use]
 extern crate winrust_common;
 use winrust_common as i18n;
 use winrust_common::style::{Style, pal, style, ui_face};
+mod audio;
+mod desk;
 mod fly;
+mod net;
 use windows::{
     Win32::{
         Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
@@ -97,7 +100,7 @@ const WIFI_I: i32 = -7;
 const VOL_I: i32 = -8;
 const BAT_I: i32 = -9;
 const TAPP: i32 = -1000;
-const GEAR: i32 = -12; // the gear at the left end: the Style menu
+const GEAR: i32 = -12; // the gear at the left end (`topbar.gear`): the Style menu, right click: the bar's settings
 const GEAR_X: (i32, i32) = (6, 36); // its left edge and width, before scaling (sc() is applied where used)
 const SYS_GRP: i32 = -11; // hover key of the one pill around wifi + volume + battery (they open the same panel)
 const WIN_START: u32 = WM_APP + 10; // posted by the keyboard hook: Win key pressed alone
@@ -105,11 +108,91 @@ const ALT_TAB: u32 = WM_APP + 11; // posted by the keyboard hook: Alt+Tab (wp 1 
 const ALT_UP: u32 = WM_APP + 12; // posted by the keyboard hook: Alt released while switching (wp 1 = Esc: cancel)
 static SWITCHING: AtomicBool = AtomicBool::new(false); // Alt+Tab switcher open (the hook thread reads it)
 static FULLSCREEN: AtomicBool = AtomicBool::new(false);
-static DESK_HIDE: AtomicBool = AtomicBool::new(false); // the desktop in front and the pointer away from the bar for 2 s
+static AUTO_HID: AtomicBool = AtomicBool::new(false); // auto-hide (`topbar.autohide`) has the bar slid away
 static WIN_ALONE: AtomicBool = AtomicBool::new(false);
 static BAR: AtomicIsize = AtomicIsize::new(0); // the bar window, for the hook thread
 const SNIP: u32 = WM_APP + 13; // posted by the keyboard hook: PrtSc / Win+Shift+S with no explorer to handle them
 static EXPLORER_UP: AtomicBool = AtomicBool::new(true); // explorer's taskbar exists (it handles PrtSc itself then); refreshed by the bar
+const MOUSE_HOOK: u32 = WM_APP + 14; // thread message to the hook thread: install / remove the mouse hook as WANT_MOUSE says
+const DESK_CLICK: u32 = WM_APP + 15; // posted by the mouse hook: a button went down at screen point (wp, lp)
+const IMPORT_DONE: u32 = WM_APP + 16; // posted by fly::start_import's thread: wp apps were added to Start
+static HOOK_TID: AtomicU32 = AtomicU32::new(0); // the hook thread, once it has a message queue
+static WANT_MOUSE: AtomicBool = AtomicBool::new(false); // the mouse hook is needed (desktop icons hide until a click)
+
+/// The settings the bar works from (`%APPDATA%\WinRust\config.txt`, see winrust_common::config), read into one value so
+/// a paint or a mouse move never touches the file.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Cfg {
+    autohide: bool,
+    hide_ms: u64,
+    left: bool,     // Start and the app buttons at the left end instead of the middle
+    labels: bool,   // open windows get a wide button with the title
+    label_w: i32,   // its width, logical px
+    search: bool,   // the search button is shown
+    gear: bool,     // the gear button is shown
+    desk_icons: bool,
+    desk_s: u64,
+    power: u8,        // Start's buttons: bit n = fly::POWER[n] is shown
+    power_menu: bool, // ...behind one power button
+}
+
+impl Cfg {
+    const DEFAULT: Cfg = Cfg { autohide: false, hide_ms: 800, left: false, labels: false, label_w: 160, search: true, gear: false, desk_icons: false, desk_s: 5, power: 0b110101, power_menu: false };
+
+    fn load() -> Cfg {
+        use winrust_common::config as c;
+        Cfg {
+            autohide: c::flag("topbar.autohide"),
+            hide_ms: c::int("topbar.autohide_delay_ms", 0, 60_000) as u64,
+            left: c::text("topbar.align").trim().eq_ignore_ascii_case("left"),
+            labels: c::flag("topbar.labels"),
+            label_w: c::int("topbar.label_width", 80, 400) as i32,
+            search: c::flag("topbar.search"),
+            gear: c::flag("topbar.gear"),
+            desk_icons: c::flag("desktop.autohide_icons"),
+            desk_s: c::int("desktop.icons_delay_s", 1, 3600) as u64,
+            power: fly::power_mask(&c::text("start.buttons")),
+            power_menu: c::flag("start.power_menu"),
+        }
+    }
+}
+
+fn cfg() -> Cfg {
+    CFG.get()
+}
+
+/// Reads the settings again and applies what changed (twice a second, and at once when a WinRust program says so).
+unsafe fn cfg_apply(hwnd: HWND) {
+    let new = Cfg::load();
+    let old = CFG.replace(new);
+    if new == old {
+        return;
+    }
+    if new.autohide != old.autohide {
+        place(hwnd); // an auto-hiding bar reserves no strip of the screen
+        SetTimer(hwnd, 3, if new.autohide { 100 } else { 250 }, None); // the pointer at the screen edge is noticed sooner
+    }
+    if new.desk_icons != old.desk_icons {
+        mouse_hook_sync(new.desk_icons);
+        if !new.desk_icons {
+            desk::restore();
+        }
+    }
+    if new.labels != old.labels {
+        refresh_buttons(); // the titles are read only while they are shown
+    }
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Has the hook thread install or remove the low-level mouse hook: it costs a thread switch per mouse move, so it
+/// exists only while a setting needs it.
+unsafe fn mouse_hook_sync(on: bool) {
+    WANT_MOUSE.store(on, Relaxed);
+    let t = HOOK_TID.load(Relaxed);
+    if t != 0 {
+        PostThreadMessageW(t, MOUSE_HOOK, 0, 0);
+    }
+}
 
 struct Pin {
     lnk: Vec<u16>,
@@ -120,6 +203,7 @@ struct Btn {
     pin: Option<usize>,
     wins: Vec<HWND>,
     icon: HICON, // the window's icon for unpinned buttons, looked up on refresh, not every animation frame
+    title: String, // the window's title, read only when buttons show it (`topbar.labels`)
 }
 
 /// One notification-area icon, as an app registered it through Shell_NotifyIcon (we own the "Shell_TrayWnd" they talk to).
@@ -191,7 +275,11 @@ thread_local! {
     static BUSY: Cell<bool> = const { Cell::new(false) }; // a fade is still running: the painter asks for another frame
     static BAR_P: Cell<f32> = const { Cell::new(0.0) }; // bar slide: 0 = off screen, 1 = in place
     static BAR_T: Cell<u64> = const { Cell::new(0) };
-    static DESK_T: Cell<u64> = const { Cell::new(0) }; // last moment the bar had a reason to stay on the desktop
+    static HIDE_T: Cell<u64> = const { Cell::new(0) }; // auto-hide: last moment the bar had a reason to stay
+    static CFG: Cell<Cfg> = const { Cell::new(Cfg::DEFAULT) };
+    static LANGS: Cell<usize> = const { Cell::new(0) }; // installed keyboard layouts: the language button shows only with two or more
+    static HAS_WIFI: Cell<bool> = const { Cell::new(false) }; // the PC has a Wi-Fi adapter
+    static ETHS: RefCell<Vec<net::Eth>> = const { RefCell::new(Vec::new()) }; // wired adapters with a live link
     static SCALE: Cell<f32> = const { Cell::new(1.0) };
     static OLD_STATE: Cell<usize> = const { Cell::new(ABS_ALWAYSONTOP as usize) };
     static BAT: Cell<(i32, bool)> = const { Cell::new((-1, false)) }; // (percent or -1 = no battery, on AC)
@@ -215,6 +303,15 @@ fn sc(v: i32) -> i32 {
 }
 fn bar_h() -> i32 {
     sc(BAR_H)
+}
+/// Width of the gear's strip at the left end; 0 while the gear is hidden (its menus are in the right-click menu).
+fn gear_w() -> i32 {
+    if cfg().gear { sc(GEAR_X.0 + GEAR_X.1) } else { 0 }
+}
+unsafe fn win_title(w: HWND) -> String {
+    let mut b = [0u16; 256];
+    let n = GetWindowTextW(w, b.as_mut_ptr(), 256).max(0) as usize;
+    String::from_utf16_lossy(&b[..n])
 }
 /// Screen y of the bar's top edge when it is in place (bottom of the primary monitor, or its top in the tiling style).
 unsafe fn bar_top() -> i32 {
@@ -546,7 +643,7 @@ unsafe fn tip_text(h: i32) -> String {
         SEARCH => "Search".into(),
         0 => "Start".into(),
         TAPP => "Hidden icons".into(),
-        GEAR => t!("Стиль", "Style").into(),
+        GEAR => t!("Стиль · правый клик: настройки панели", "Style · right click: bar settings").into(),
         CLOCK => {
             let mut t: SYSTEMTIME = zeroed();
             GetLocalTime(&mut t);
@@ -558,10 +655,16 @@ unsafe fn tip_text(h: i32) -> String {
         WIFI_I => match net() {
             Link::Wifi(q) => tf!("Wi‑Fi · сигнал {q}%", "Wi‑Fi · signal {q}%"),
             Link::NoInternet(_) => t!("Wi‑Fi подключён, но интернета нет", "Wi‑Fi connected, no internet").into(),
-            Link::Cable => t!("Интернет по кабелю", "Internet over a cable").into(),
+            Link::Cable => match ETHS.with_borrow(|e| e.first().map(|e| (e.name.clone(), net::speed_text(e.bps)))) {
+                Some((name, speed)) if !speed.is_empty() => tf!("{name} · {speed} · интернет есть", "{name} · {speed} · online"),
+                Some((name, _)) => tf!("{name} · интернет есть", "{name} · online"),
+                None => t!("Интернет по кабелю", "Internet over a cable").into(),
+            },
+            Link::CableNoInternet => t!("Ethernet подключён, но интернета нет", "Ethernet connected, no internet").into(),
+            Link::Offline if !HAS_WIFI.get() => t!("Сетевой кабель не подключён", "Network cable unplugged").into(),
             Link::Offline => t!("Нет подключения к сети", "Not connected").into(),
         },
-        VOL_I => vol_tip(),
+        VOL_I => format!("{}\n{}", vol_tip(), t!("Правый клик: устройства и микрофон", "Right click: devices and microphone")),
         BAT_I => match BAT.get() {
             (p, ac) if p >= 0 => format!("Battery {p}%{}", if ac { " · plugged in" } else { "" }),
             _ => String::new(),
@@ -595,6 +698,11 @@ fn vol_tip() -> String {
 
 /// Shows `s` in a small rounded popup above the bar, centered on screen x `cx`.
 unsafe fn show_tip(s: String, cx: i32) {
+    show_tip_at(s, cx, None);
+}
+
+/// ...or, with `above`, just over that screen y (a button inside a panel).
+unsafe fn show_tip_at(s: String, cx: i32, above: Option<i32>) {
     let tw = TIPWND.get();
     if s.is_empty() || tw.is_null() {
         return;
@@ -610,7 +718,12 @@ unsafe fn show_tip(s: String, cx: i32) {
     TIP.set(s);
     SetWindowRgn(tw, CreateRoundRectRgn(0, 0, w + 1, h + 1, rr(8), rr(8)), 1);
     let x = (cx - w / 2).clamp(sc(4), GetSystemMetrics(SM_CXSCREEN) - w - sc(4));
-    SetWindowPos(tw, HWND_TOPMOST, x, if at_top() { bar_h() - bar_off() + sc(6) } else { bar_top() + bar_off() - h - sc(6) }, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    let y = match above {
+        Some(y) => y - h - sc(6),
+        None if at_top() => bar_h() - bar_off() + sc(6),
+        None => bar_top() + bar_off() - h - sc(6),
+    };
+    SetWindowPos(tw, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(tw, null(), 1);
 }
 
@@ -743,7 +856,8 @@ unsafe fn place(hwnd: HWND) {
     ab.hWnd = hwnd;
     // the reserved strip: the bar itself plus the dock's gap under it
     // the dock reserves nothing: maximized windows take the whole screen and the dock slides away over them
-    let strip = if style() == Style::Dock { 0 } else { bar_h() };
+    // neither does an auto-hiding bar: it slides in over the windows
+    let strip = if style() == Style::Dock || cfg().autohide { 0 } else { bar_h() };
     if at_top() {
         ab.uEdge = ABE_TOP;
         ab.rc = RECT { left: 0, top: 0, right: cx, bottom: strip };
@@ -903,12 +1017,14 @@ thread_local! {
     static EXE_ICONS: RefCell<HashMap<String, HICON>> = RefCell::new(HashMap::new()); // crisp icons of running apps, by exe
 }
 
+/// Processes that run someone else's app: their exe says nothing about the window (its icon, how to start it again).
+const HOSTS: [&str; 8] = ["applicationframehost.exe", "javaw.exe", "java.exe", "pythonw.exe", "python.exe", "mmc.exe", "rundll32.exe", "dllhost.exe"];
+
 /// Icon of a running window for its bar button: its exe's icon at the exact size (cached), else what the window reports.
 /// Apps run by a generic host (Store apps in ApplicationFrameHost, Java games in javaw, scripts in python...) would all
 /// get the host's icon: those keep the window's own icon.
 unsafe fn win_icon(w: HWND) -> HICON {
     let exe = exe_of(w);
-    const HOSTS: [&str; 8] = ["applicationframehost.exe", "javaw.exe", "java.exe", "pythonw.exe", "python.exe", "mmc.exe", "rundll32.exe", "dllhost.exe"];
     if exe.is_empty() || HOSTS.iter().any(|h| exe.rsplit('\\').next() == Some(*h)) {
         return icon_of(w);
     }
@@ -982,8 +1098,8 @@ unsafe fn load_pins() {
 fn refresh_buttons() {
     let mut wins: Vec<HWND> = Vec::new();
     unsafe { EnumWindows(Some(collect), &mut wins as *mut _ as LPARAM) };
-    let mut btns = vec![Btn { pin: None, wins: vec![], icon: null_mut() }];
-    PINS.with_borrow(|pins| btns.extend((0..pins.len()).map(|i| Btn { pin: Some(i), wins: vec![], icon: null_mut() })));
+    let mut btns = vec![Btn { pin: None, wins: vec![], icon: null_mut(), title: String::new() }];
+    PINS.with_borrow(|pins| btns.extend((0..pins.len()).map(|i| Btn { pin: Some(i), wins: vec![], icon: null_mut(), title: String::new() })));
     let mut loose: Vec<HWND> = Vec::new();
     for w in wins {
         let exe = unsafe { exe_of(w) };
@@ -997,8 +1113,17 @@ fn refresh_buttons() {
     ORDER.with_borrow_mut(|o| {
         o.retain(|w| loose.contains(w));
         o.extend(loose.iter().filter(|w| !o.contains(w)).copied().collect::<Vec<_>>());
-        btns.extend(o.iter().map(|&w| Btn { pin: None, wins: vec![w], icon: unsafe { win_icon(w) } }));
+        btns.extend(o.iter().map(|&w| Btn { pin: None, wins: vec![w], icon: unsafe { win_icon(w) }, title: String::new() }));
     });
+    if cfg().labels {
+        // the title of the window in front when it is one of the button's, else of its first window
+        let fg = unsafe { GetForegroundWindow() };
+        for b in btns.iter_mut().skip(1) {
+            if let Some(&w) = b.wins.iter().find(|&&w| w == fg).or(b.wins.first()) {
+                b.title = unsafe { win_title(w) };
+            }
+        }
+    }
     BTNS.set(btns);
 }
 
@@ -1054,10 +1179,12 @@ thread_local! {
 unsafe fn read_wifi() {
     let mut h: HANDLE = WLAN.get() as HANDLE;
     let mut q = -1;
+    let mut has = None; // a Wi-Fi adapter exists; None = could not tell this time
     if h.is_null() {
         let mut ver = 0u32;
         if WlanOpenHandle(2, null(), &mut ver, &mut h) != 0 {
             h = null_mut();
+            has = Some(false); // no WLAN service: a desktop PC on a cable
         }
         WLAN.set(h as usize);
     }
@@ -1068,6 +1195,7 @@ unsafe fn read_wifi() {
             WLAN.set(0);
         } else {
             let l = &*list;
+            has = Some(l.dwNumberOfItems > 0);
             for i in 0..l.dwNumberOfItems as usize {
                 let ifc = &*l.InterfaceInfo.as_ptr().add(i);
                 let (mut size, mut data) = (0u32, null_mut());
@@ -1080,6 +1208,10 @@ unsafe fn read_wifi() {
         }
     }
     WIFI.set(q);
+    if let Some(has) = has {
+        HAS_WIFI.set(has);
+    }
+    ETHS.set(net::ethernets());
     // Windows' own verdict (the same one its tray icon shows): a connection without internet is not "online"
     use windows_sys::Win32::{NetworkManagement::IpHelper::GetNetworkConnectivityHint, Networking::WinSock::{NL_NETWORK_CONNECTIVITY_HINT, NetworkConnectivityLevelHintConstrainedInternetAccess, NetworkConnectivityLevelHintInternetAccess}};
     let mut hint: NL_NETWORK_CONNECTIVITY_HINT = zeroed();
@@ -1096,6 +1228,7 @@ enum Link {
     Wifi(i32),      // on wifi with internet, signal 0..100
     NoInternet(i32), // on wifi, but no way out
     Cable,          // internet over ethernet
+    CableNoInternet, // a cable with a live link, but no way out
     Offline,        // no connection at all
 }
 
@@ -1104,6 +1237,7 @@ fn net() -> Link {
         (q, true) if q >= 0 => Link::Wifi(q),
         (q, false) if q >= 0 => Link::NoInternet(q),
         (_, true) => Link::Cable,
+        _ if ETHS.with_borrow(|e| !e.is_empty()) => Link::CableNoInternet,
         _ => Link::Offline,
     }
 }
@@ -1141,25 +1275,48 @@ unsafe fn wifi_glyph(dc: HDC, cx: i32, cy: i32, s: i32, lit: i32, on: u32, off: 
     GdipCreateSolidFill(argb(if lit > 0 { on } else { off }), &mut br);
     GdipFillEllipse(g, br as *mut GpBrush, bx - w * 0.9, by - w * 0.9, w * 1.8, w * 1.8);
     GdipDeleteBrush(br as *mut GpBrush);
-    // the mark sits at the lower right, on a cut-out of the background so it stays readable over the arcs
-    let (mx, my, mr) = (bx + sf * 0.42, by - sf * 0.08, sf * 0.26);
-    if mark > 0 {
-        let mut bg: *mut GpSolidFill = null_mut();
-        GdipCreateSolidFill(argb(pal().bg), &mut bg);
-        GdipFillEllipse(g, bg as *mut GpBrush, mx - mr, my - mr, 2.0 * mr, 2.0 * mr);
-        GdipDeleteBrush(bg as *mut GpBrush);
-        let c = if mark == 1 { on } else { WARN };
-        let p = pen(c, (w * 0.8).max(1.4));
-        let d = mr * 0.5;
-        if mark == 1 {
-            GdipDrawLine(g, p, mx - d, my - d, mx + d, my + d);
-            GdipDrawLine(g, p, mx + d, my - d, mx - d, my + d);
-        } else {
-            GdipDrawLine(g, p, mx, my - d * 1.2, mx, my + d * 0.2);
-            GdipDrawLine(g, p, mx, my + d * 0.95, mx, my + d * 1.0);
-        }
-        GdipDeletePen(p);
+    // the mark sits at the lower right
+    net_mark(g, bx + sf * 0.42, by - sf * 0.08, sf * 0.26, w, mark, on);
+    GdipDeleteGraphics(g);
+}
+
+/// The badge of a network icon, centered on (mx, my) with radius `mr`: 1 a cross in `on` (not connected), 2 an
+/// exclamation mark (connected, no internet). It sits on a cut-out of the background so it stays readable over the icon.
+unsafe fn net_mark(g: *mut GpGraphics, mx: f32, my: f32, mr: f32, w: f32, mark: u8, on: u32) {
+    if mark == 0 {
+        return;
     }
+    let argb = |c: u32| 0xFF00_0000 | (c & 255) << 16 | (c & 0xFF00) | (c >> 16 & 255);
+    let mut bg: *mut GpSolidFill = null_mut();
+    GdipCreateSolidFill(argb(pal().bg), &mut bg);
+    GdipFillEllipse(g, bg as *mut GpBrush, mx - mr, my - mr, 2.0 * mr, 2.0 * mr);
+    GdipDeleteBrush(bg as *mut GpBrush);
+    let mut p: *mut GpPen = null_mut();
+    GdipCreatePen1(argb(if mark == 1 { on } else { WARN }), (w * 0.8).max(1.4), UnitPixel, &mut p);
+    GdipSetPenStartCap(p, LineCapRound);
+    GdipSetPenEndCap(p, LineCapRound);
+    let d = mr * 0.5;
+    if mark == 1 {
+        GdipDrawLine(g, p, mx - d, my - d, mx + d, my + d);
+        GdipDrawLine(g, p, mx + d, my - d, mx - d, my + d);
+    } else {
+        GdipDrawLine(g, p, mx, my - d * 1.2, mx, my + d * 0.2);
+        GdipDrawLine(g, p, mx, my + d * 0.95, mx, my + d * 1.0);
+    }
+    GdipDeletePen(p);
+}
+
+/// The Ethernet symbol in colour `c`, `s` px, with the same marks as the Wi-Fi one (drawn in `mark_col`).
+unsafe fn eth_glyph(dc: HDC, cx: i32, cy: i32, s: i32, f_glyph: HFONT, c: u32, mark_col: u32, mark: u8) {
+    SelectObject(dc, f_glyph);
+    text(dc, "\u{E839}", RECT { left: cx - s, top: cy - s, right: cx + s, bottom: cy + s }, c, DT_CENTER);
+    let mut g: *mut GpGraphics = null_mut();
+    if mark == 0 || GdipCreateFromHDC(dc, &mut g) != 0 || g.is_null() {
+        return;
+    }
+    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    let sf = s as f32;
+    net_mark(g, cx as f32 + sf * 0.42, cy as f32 + sf * 0.28, sf * 0.26, (sf * 0.12).max(1.6), mark, mark_col);
     GdipDeleteGraphics(g);
 }
 
@@ -1193,11 +1350,11 @@ unsafe fn net_icon(dc: HDC, cx: i32, cy: i32, s: i32, f_glyph: HFONT) {
     match net() {
         Link::Wifi(q) => wifi_glyph(dc, cx, cy, s, arcs_lit(q), on, off, 0),
         Link::NoInternet(q) => wifi_glyph(dc, cx, cy, s, arcs_lit(q), mix(on, pal().bg, 0.3), off, 2),
+        // a PC without Wi-Fi shows the cable's state, not a crossed-out Wi-Fi it never had
+        Link::Offline if !HAS_WIFI.get() => eth_glyph(dc, cx, cy, s, f_glyph, mix(pal().dim, pal().bg, 0.2), on, 1),
         Link::Offline => wifi_glyph(dc, cx, cy, s, 0, on, mix(pal().dim, pal().bg, 0.2), 1),
-        Link::Cable => {
-            SelectObject(dc, f_glyph);
-            text(dc, "\u{E839}", RECT { left: cx - s, top: cy - s, right: cx + s, bottom: cy + s }, on, DT_CENTER);
-        }
+        Link::Cable => eth_glyph(dc, cx, cy, s, f_glyph, on, on, 0),
+        Link::CableNoInternet => eth_glyph(dc, cx, cy, s, f_glyph, mix(on, pal().bg, 0.3), on, 2),
     }
 }
 
@@ -1219,6 +1376,10 @@ fn refresh() {
         let mut p: SYSTEM_POWER_STATUS = zeroed();
         let ok = GetSystemPowerStatus(&mut p) != 0 && p.BatteryFlag & 128 == 0 && p.BatteryLifePercent <= 100;
         BAT.set(if ok { (p.BatteryLifePercent as i32, p.ACLineStatus == 1) } else { (-1, false) });
+        LANGS.set(GetKeyboardLayoutList(0, null_mut()).max(0) as usize);
+        if n % 10 == 0 {
+            EP.set(None); // the default output may have been changed elsewhere: look it up again every few seconds
+        }
         read_volume();
         let up = !find_other("Shell_TrayWnd").is_null();
         if EXPLORER_UP.swap(up, Relaxed) && !up {
@@ -1250,49 +1411,117 @@ fn refresh() {
 // ---------- layout / hit-testing ----------
 
 struct Layout {
-    x0: i32, // first slot: the search button; Start and the rest follow
-    bw: i32,
-    gap: i32,
+    slots: Vec<(i32, i32)>, // (x, width) of the search button and of every app button, left to right
+    search: Option<usize>,  // the search button's slot; None = hidden (`topbar.search`)
     apps: (i32, i32),
+    lang_w: i32, // the language button's width; 0 with a single keyboard layout
     sys: (i32, i32),
     clock: (i32, i32),
 }
 
+impl Layout {
+    /// (x, width) of app button `i` (an index into BTNS).
+    fn btn(&self, i: usize) -> (i32, i32) {
+        self.slots.get(slot_of(self.search, i)).copied().unwrap_or((0, 0))
+    }
+    fn search_at(&self) -> Option<(i32, i32)> {
+        self.search.and_then(|s| self.slots.get(s).copied())
+    }
+    /// What is at client x among the buttons: SEARCH, an index into BTNS, or NONE.
+    fn slot_hit(&self, x: i32) -> i32 {
+        match self.slots.iter().position(|&(sx, sw)| x >= sx && x < sx + sw) {
+            None => NONE,
+            Some(s) if self.search == Some(s) => SEARCH,
+            Some(s) => (s - self.search.is_some_and(|q| s > q) as usize) as i32,
+        }
+    }
+}
+
+/// The slot of app button `i` when the search button sits in slot `search`.
+fn slot_of(search: Option<usize>, i: usize) -> usize {
+    match search {
+        Some(s) if i >= s => i + 1,
+        _ => i,
+    }
+}
+
+/// Widths of the buttons in a row `avail` px wide. `wide[i]`: the button carries a title and wants `label` px, the
+/// others are `icon` px. When they do not fit, the titled ones give way first (down to an icon's width), then all
+/// shrink together, to `min` at most.
+fn slot_widths(wide: &[bool], avail: i32, icon: i32, label: i32, min: i32, gap: i32) -> Vec<i32> {
+    let n = wide.len() as i32;
+    let nl = wide.iter().filter(|&&w| w).count() as i32;
+    let room = avail - gap * (n - 1).max(0);
+    let (mut iw, mut lw) = (icon, label.max(icon));
+    if (n - nl) * iw + nl * lw > room {
+        if nl > 0 {
+            lw = ((room - (n - nl) * iw) / nl).clamp(iw, lw);
+        }
+        if (n - nl) * iw + nl * lw > room {
+            iw = (room / n.max(1)).clamp(min, icon);
+            lw = iw;
+        }
+    }
+    wide.iter().map(|&w| if w { lw } else { iw }).collect()
+}
+
 fn layout(w: i32) -> Layout {
+    let c = cfg();
     let gap = sc(4);
     let clock = (w - sc(96), w - sc(6));
-    let sys = (clock.0 - sc(4) - sc(150 + if BAT.get().0 >= 0 { 66 } else { 0 }), clock.0 - sc(4));
+    // language (only when there is a second one to switch to), then the pill: network, volume and, on a laptop, the battery
+    let lang_w = if LANGS.get() > 1 { sc(44) } else { 0 };
+    let sys = (clock.0 - sc(4) - lang_w - sc(68 + if BAT.get().0 >= 0 { 104 } else { 0 }), clock.0 - sc(4));
     let apps = (sys.0 - sc(24) * tray_count() as i32, sys.0);
-    let margin = (w - apps.0) + sc(8); // keep the button group centered and clear of both sides
-    let n = BTNS.with_borrow(|b| b.len()) as i32 + 1; // + the search slot
-    let bw = (((w - 2 * margin + gap) / n.max(1)) - gap).clamp(sc(16), sc(44));
-    // centered on search + Start + pins only: opening an unpinned window adds a button on the right instead of shifting Start left
-    let fixed = (PINS.with_borrow(|p| p.len()) as i32 + 2).min(n);
-    // ...but never so far right that the windows' buttons run into the tray: then the whole row shifts left
-    let right_limit = w - margin - (n * (bw + gap) - gap);
-    Layout { x0: ((w - (fixed * (bw + gap) - gap)) / 2).min(right_limit).max(sc(GEAR_X.0 + GEAR_X.1 + 6)), bw, gap, apps, sys, clock } // clear of the gear
+    let margin = (w - apps.0) + sc(8); // keep the buttons clear of the tray side
+    let left_min = if c.gear { gear_w() + sc(6) } else { sc(4) } + if style() == Style::Dock { sc(10) } else { 0 }; // the dock's round end
+    // left-aligned: Start in the corner, then search; centered: search, then Start
+    let mut wide: Vec<bool> = BTNS.with_borrow(|b| b.iter().enumerate().map(|(i, b)| c.labels && i > 0 && !b.wins.is_empty()).collect());
+    let search = c.search.then(|| if c.left { 1.min(wide.len()) } else { 0 });
+    if let Some(s) = search {
+        wide.insert(s, false);
+    }
+    let n = wide.len() as i32;
+    let avail = if c.left { w - margin - left_min } else { w - 2 * margin };
+    let ws = slot_widths(&wide, avail, sc(44), sc(c.label_w), sc(16), gap);
+    let span = |k: usize| ws[..k].iter().sum::<i32>() + gap * (k as i32 - 1).max(0);
+    let x0 = if c.left {
+        left_min
+    } else {
+        // centered on search + Start + pins only: opening an unpinned window adds a button on the right instead of shifting Start left
+        let fixed = (PINS.with_borrow(|p| p.len()) + 1 + search.is_some() as usize).min(n as usize);
+        // ...but never so far right that the windows' buttons run into the tray: then the whole row shifts left
+        ((w - span(fixed)) / 2).min(w - margin - span(n as usize)).max(left_min)
+    };
+    let mut x = x0;
+    let slots = ws
+        .iter()
+        .map(|&bw| {
+            x += bw + gap;
+            (x - bw - gap, bw)
+        })
+        .collect();
+    Layout { slots, search, apps, lang_w, sys, clock }
 }
 
 unsafe fn hit(hwnd: HWND, x: i32) -> i32 {
     let mut r: RECT = zeroed();
     GetClientRect(hwnd, &mut r);
     let l = layout(r.right);
-    if x < sc(GEAR_X.0 + GEAR_X.1) {
+    if x < gear_w() {
         return GEAR;
     }
     if x >= l.clock.0 {
         return CLOCK;
     }
     if x >= l.sys.0 {
-        let d = x - l.sys.0;
-        return if d < sc(42) { LANG } else if d < sc(74) { WIFI_I } else if d < sc(106) { VOL_I } else { BAT_I };
+        let d = x - l.sys.0 - l.lang_w; // within the network / volume / battery pill
+        return if d < 0 { LANG } else if d < sc(34) { WIFI_I } else if d < sc(68) || BAT.get().0 < 0 { VOL_I } else { BAT_I };
     }
     if x >= l.apps.0 {
         return TAPP + (x - l.apps.0) / sc(24);
     }
-    let n = BTNS.with_borrow(|b| b.len()) as i32 + 1;
-    let (d, i) = (x - l.x0, (x - l.x0) / (l.bw + l.gap));
-    if d < 0 || d % (l.bw + l.gap) >= l.bw || i >= n { NONE } else if i == 0 { SEARCH } else { i - 1 }
+    l.slot_hit(x)
 }
 
 // ---------- animation ----------
@@ -1390,7 +1619,7 @@ unsafe fn bar_anim(hwnd: HWND) {
 }
 
 unsafe fn bar_step(hwnd: HWND) {
-    let target = if FULLSCREEN.load(Relaxed) { 0.0 } else { 1.0 }; // hides only for a fullscreen game or video: not over the desktop, not in any style
+    let target = if FULLSCREEN.load(Relaxed) || AUTO_HID.load(Relaxed) { 0.0 } else { 1.0 }; // hides for a fullscreen game or video, and when auto-hide says so
     let now = now_ms();
     let dt = now.saturating_sub(BAR_T.replace(now)).min(50) as f32;
     let p = BAR_P.get();
@@ -1420,6 +1649,10 @@ unsafe fn fullscreen_now(bar: HWND) -> bool {
     if matches!(String::from_utf16_lossy(&cls[..n]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "RustExplorer") {
         return false; // the desktop itself is full size (rs-shell's desktop is a rust-explorer window; a file manager is never "fullscreen")
     }
+    // an auto-hiding bar reserves nothing, so a maximized window covers the whole monitor too: that is not "fullscreen"
+    if cfg().autohide && IsZoomed(fg) != 0 && GetWindowLongW(fg, GWL_STYLE) as u32 & (WS_CAPTION | WS_THICKFRAME) != 0 {
+        return false;
+    }
     let mut r: RECT = zeroed();
     GetWindowRect(fg, &mut r);
     let mut mi: MONITORINFO = zeroed();
@@ -1429,26 +1662,25 @@ unsafe fn fullscreen_now(bar: HWND) -> bool {
     (m.left, m.top) == (0, 0) && r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
 }
 
-/// True when no app window is on screen (none open, or all minimized: Win+D): the user is looking at the desktop.
-unsafe fn desktop_now() -> bool {
-    BTNS.with_borrow(|b| b.iter().flat_map(|b| &b.wins).all(|&w| IsIconic(w) != 0))
-}
-
 unsafe fn fs_update(hwnd: HWND) {
     let fs = fullscreen_now(hwnd);
     // a fullscreen game keeps the screen: the pointer at the bottom edge does not bring the bar (games park it at the
     // edges all the time); Win opens Start, which brings the bar with it
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
-    // desktop in front: the bar leaves 2 s after the pointer does and comes back at the bottom edge (an open flyout keeps it)
-    let now = now_ms();
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let over = if at_top() { pt.y <= 0 || (pt.y < bar_h() && BAR_P.get() > 0.0) } else { pt.y >= sh - 1 || (pt.y >= sh - bar_h() - dock_gap() && BAR_P.get() > 0.0) };
-    if fs || !(desktop_now() || dock_covered()) || fly::any_open() || over {
-        DESK_T.set(now);
+    // auto-hide: the bar leaves a moment after the pointer does and comes back when the pointer touches its screen edge
+    // (an open flyout, menu or tray popup keeps it)
+    let (now, c) = (now_ms(), cfg());
+    let (sh, (bx, bw), up) = (GetSystemMetrics(SM_CYSCREEN), bar_x_w(), BAR_P.get() > 0.0);
+    let over = pt.x >= bx && pt.x < bx + bw && if at_top() { pt.y == 0 || ((0..bar_h()).contains(&pt.y) && up) } else { pt.y == sh - 1 || ((sh - bar_h() - dock_gap()..sh).contains(&pt.y) && up) };
+    if !c.autohide || fs || over || fly::any_open() || IsWindowVisible(TRAYFLY.get()) != 0 || HIDE_T.get() == 0 {
+        HIDE_T.set(now);
     }
-    let desk = !fs && now.saturating_sub(DESK_T.get()) >= 2000;
-    if DESK_HIDE.swap(desk, Relaxed) != desk {
+    let hide = c.autohide && !fs && now.saturating_sub(HIDE_T.get()) >= c.hide_ms;
+    if AUTO_HID.swap(hide, Relaxed) != hide {
+        if hide {
+            hide_tip(hwnd);
+        }
         bar_anim(hwnd);
     }
     if FULLSCREEN.swap(fs, Relaxed) != fs {
@@ -1458,23 +1690,6 @@ unsafe fn fs_update(hwnd: HWND) {
         }
         bar_anim(hwnd);
     }
-}
-
-/// The dock is in the way of the window in front (a maximized one, or one dragged down under it): it hides like over the
-/// desktop and comes back when the pointer touches the bottom edge.
-unsafe fn dock_covered() -> bool {
-    if style() != Style::Dock {
-        return false;
-    }
-    let fg = GetForegroundWindow();
-    if fg.is_null() || IsIconic(fg) != 0 || fg == BAR.load(Relaxed) as HWND || fly::any_open() {
-        return false;
-    }
-    let mut r: RECT = zeroed();
-    GetWindowRect(fg, &mut r);
-    let (x, w) = bar_x_w();
-    let top = GetSystemMetrics(SM_CYSCREEN) - bar_h() - dock_gap();
-    r.bottom > top && r.right > x && r.left < x + w
 }
 
 /// SetForegroundWindow that also works when the request comes from a keyboard hook (we have not "received input" then):
@@ -1550,6 +1765,15 @@ unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 WIN_ALONE.store(false, Relaxed); // Win+something else: a shortcut, not a Start press
             }
         }
+    }
+    CallNextHookEx(null_mut(), n, w, l)
+}
+
+/// Only while a setting needs it (see mouse_hook_sync): tells the bar where a mouse button went down.
+unsafe extern "system" fn mouse_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if n >= 0 && matches!(w as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+        let m = &*(l as *const MSLLHOOKSTRUCT);
+        PostMessageW(BAR.load(Relaxed) as HWND, DESK_CLICK, m.pt.x as isize as usize, m.pt.y as isize);
     }
     CallNextHookEx(null_mut(), n, w, l)
 }
@@ -1709,7 +1933,7 @@ unsafe fn lang_menu(bar: HWND) {
     let (list, cur) = layouts();
     let mut items: Vec<fly::MItem> = list.iter().map(|&k| {
         let (name, short) = layout_names(k);
-        fly::MItem::new(name).on(k == cur).hint(Box::leak(short.into_boxed_str())) // a handful of short strings, kept for the bar's lifetime
+        fly::MItem::new(name).on(k == cur).hint(short)
     }).collect();
     items.push(fly::MItem::new(t!("Языковые параметры", "Language settings")).sep());
     let head = (null_mut(), "\u{E775}", t!("Язык ввода", "Input language").to_string(), t!("Win+Пробел — следующий", "Win+Space — next one").to_string());
@@ -1757,8 +1981,9 @@ thread_local! {
 unsafe fn view_sig() -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    BTNS.with_borrow(|b| b.iter().for_each(|b| (b.pin, b.icon as usize, b.wins.iter().map(|&w| (w as usize, IsIconic(w))).collect::<Vec<_>>()).hash(&mut h)));
+    BTNS.with_borrow(|b| b.iter().for_each(|b| (b.pin, b.icon as usize, &b.title, b.wins.iter().map(|&w| (w as usize, IsIconic(w))).collect::<Vec<_>>()).hash(&mut h)));
     (GetForegroundWindow() as usize, BAT.get(), VOL.get(), WIFI.get(), INET.get(), EXPLORER_UP.load(Relaxed), clock_texts(), lang_name()).hash(&mut h);
+    (cfg(), LANGS.get(), HAS_WIFI.get(), ETHS.with_borrow(|e| e.len())).hash(&mut h);
     TAPPS.with_borrow(|t| t.iter().for_each(|x| (x.hwnd as usize, x.uid, x.icon as usize, x.hidden, &x.tip).hash(&mut h)));
     h.finish()
 }
@@ -1805,23 +2030,27 @@ unsafe fn paint(hwnd: HWND) {
     let hot = HOT.get();
     let active_bg = mix(pal().active, pal().accent, 0.12); // the focused app's button: a hint of the accent, not plain grey
 
-    // the gear at the left end: the Style menu
-    let gr = RECT { left: sc(GEAR_X.0), top, right: sc(GEAR_X.0 + GEAR_X.1), bottom: bot };
-    glow(dc, GEAR, hot == GEAR, gr, pal().bg, pal().hover, sc(8));
-    SelectObject(dc, f_glyph);
-    text(dc, "\u{E713}", gr, if hot == GEAR { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
+    // the gear at the left end, when asked for: the Style menu
+    if cfg().gear {
+        let gr = RECT { left: sc(GEAR_X.0), top, right: sc(GEAR_X.0 + GEAR_X.1), bottom: bot };
+        glow(dc, GEAR, hot == GEAR, gr, pal().bg, pal().hover, sc(8));
+        SelectObject(dc, f_glyph);
+        text(dc, "\u{E713}", gr, if hot == GEAR { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
+    }
 
-    // search button (left of Start)
-    let sb = RECT { left: l.x0, top, right: l.x0 + l.bw, bottom: bot };
-    glow(dc, SEARCH, hot == SEARCH, sb, pal().bg, pal().hover, sc(8));
-    SelectObject(dc, f_glyph);
-    text(dc, "\u{E721}", sb, if hot == SEARCH { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
+    // search button (next to Start), unless it is turned off
+    if let Some((sx, sw)) = l.search_at() {
+        let sb = RECT { left: sx, top, right: sx + sw, bottom: bot };
+        glow(dc, SEARCH, hot == SEARCH, sb, pal().bg, pal().hover, sc(8));
+        SelectObject(dc, f_glyph);
+        text(dc, "\u{E721}", sb, if hot == SEARCH { pal().text } else { mix(pal().dim, pal().text, 0.5) }, DT_CENTER);
+    }
 
     // Start, pinned apps, open windows (center)
     BTNS.with_borrow(|btns| {
         for (i, b) in btns.iter().enumerate() {
-            let x = l.x0 + (i as i32 + 1) * (l.bw + l.gap);
-            let r = RECT { left: x, top, right: x + l.bw, bottom: bot };
+            let (x, bw) = l.btn(i);
+            let r = RECT { left: x, top, right: x + bw, bottom: bot };
             let act = b.wins.contains(&fg);
             let (th, ta, tp) = (hv(i as i32, hot == i as i32), hv(2000 + i as i32, act), press_t(i as i32));
             if th > 0.01 || ta > 0.01 || tp > 0.0 {
@@ -1844,19 +2073,27 @@ unsafe fn paint(hwnd: HWND) {
             };
             let key = b.pin.map(|p| -(p as isize) - 1).or_else(|| b.wins.first().map(|&w| w as isize)).unwrap_or(0);
             // squeezes on click, grows in when new, lifts a pixel on hover
-            let isz = (icon_px().min(l.bw - sc(6)) as f32 * (1.0 - 0.18 * tp) * (0.55 + 0.45 * appear(key))) as i32;
+            let isz = (icon_px().min(bw - sc(6)) as f32 * (1.0 - 0.18 * tp) * (0.55 + 0.45 * appear(key))) as i32;
+            let min = !b.wins.is_empty() && b.wins.iter().all(|&w| IsIconic(w) != 0);
+            // a button with a title: the icon at its left, the title after it (a button squeezed too narrow keeps just the icon)
+            let titled = !b.title.is_empty() && bw >= sc(84);
+            let ix = if titled { x + sc(8) + (icon_px() - isz) / 2 } else { x + (bw - isz) / 2 };
             if !ic.is_null() {
-                DrawIconEx(dc, x + (l.bw - isz) / 2, mid - isz / 2 - sc(2) - (sc(1) as f32 * th) as i32, ic, isz, isz, 0, null_mut(), DI_NORMAL);
+                DrawIconEx(dc, ix, mid - isz / 2 - sc(2) - (sc(1) as f32 * th) as i32, ic, isz, isz, 0, null_mut(), DI_NORMAL);
+            }
+            if titled {
+                SelectObject(dc, f_txt);
+                let tr = RECT { left: x + icon_px() + sc(16), top, right: x + bw - sc(8), bottom: bot - sc(4) };
+                text(dc, &b.title, tr, if min { mix(pal().dim, pal().text, 0.35) } else { pal().text }, DT_LEFT);
             }
             if !b.wins.is_empty() {
-                let min = b.wins.iter().all(|&w| IsIconic(w) != 0);
                 let pw = sc(6) + (sc(12) as f32 * ta) as i32; // the running-app pill stretches when its window is active
                 let py = bot - sc(4);
                 let col = if act { pal().accent } else if min { mix(pal().dim, pal().bg, 0.45) } else { pal().dim };
-                fill(dc, RECT { left: x + (l.bw - pw) / 2, top: py, right: x + (l.bw + pw) / 2, bottom: py + sc(3) }, col, sc(3));
+                fill(dc, RECT { left: x + (bw - pw) / 2, top: py, right: x + (bw + pw) / 2, bottom: py + sc(3) }, col, sc(3));
                 if b.wins.len() > 1 {
                     // a second, shorter pill: more than one window behind this button
-                    fill(dc, RECT { left: x + (l.bw + pw) / 2 + sc(2), top: py, right: x + (l.bw + pw) / 2 + sc(5), bottom: py + sc(3) }, col, sc(3));
+                    fill(dc, RECT { left: x + (bw + pw) / 2 + sc(2), top: py, right: x + (bw + pw) / 2 + sc(5), bottom: py + sc(3) }, col, sc(3));
                 }
             }
         }
@@ -1886,16 +2123,18 @@ unsafe fn paint(hwnd: HWND) {
     });
 
     // system group: language on its own, then one pill for wifi + volume + battery (like Windows 11: they open one panel)
+    // (the language only when there is more than one to choose from; the pill is as wide as what it holds)
     let tb = RECT { left: l.sys.0, top, right: l.sys.1, bottom: bot };
-    glow(dc, LANG, hot == LANG, RECT { left: tb.left, top, right: tb.left + sc(42), bottom: bot }, pal().bg, pal().hover, sc(8));
-    let grp = RECT { left: tb.left + sc(44), top, right: tb.right, bottom: bot };
-    let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
+    if l.lang_w > 0 {
+        glow(dc, LANG, hot == LANG, RECT { left: tb.left, top, right: tb.left + sc(42), bottom: bot }, pal().bg, pal().hover, sc(8));
+        text(dc, &lang_name(), cell(tb.left + sc(10), sc(34)), pal().text, DT_LEFT);
+    }
+    let grp = RECT { left: tb.left + l.lang_w, top, right: tb.right, bottom: bot };
+    let (tg, pg) = (hv(SYS_GRP, matches!(hot, WIFI_I | VOL_I | BAT_I) || fly::is_open(fly::Kind::Quick) || fly::is_open(fly::Kind::Sound)), press_t(WIFI_I).max(press_t(VOL_I)).max(press_t(BAT_I)));
     if tg > 0.01 || pg > 0.0 {
         fill(dc, grp, mix(mix(pal().bg, pal().hover, tg), pal().accent, 0.5 * pg), sc(8));
     }
-    let mut x = tb.left + sc(10);
-    text(dc, &lang_name(), cell(x, sc(34)), pal().text, DT_LEFT);
-    x += sc(42);
+    let mut x = grp.left + sc(8);
     net_icon(dc, x + sc(9), mid, sc(17), f_glyph);
     x += sc(32);
     SelectObject(dc, f_glyph);
@@ -2215,19 +2454,90 @@ unsafe fn open_launcher() -> bool {
     true
 }
 
-/// The gear's menu: the UI style (saved for the other WinRust programs) and putting the windows side by side.
-unsafe fn style_menu() {
+/// The Style menu (the bar's right-click menu, or the gear), centered on screen x `cx`: the UI style (saved for the
+/// other WinRust programs) and putting the windows side by side.
+unsafe fn style_menu(cx: i32) {
     let bar = BAR.load(Relaxed) as HWND;
     let names = [t!("Обычный", "Normal"), t!("Терминал", "Terminal"), t!("Плавающий док", "Floating dock"), t!("Тайлинг", "Tiling")];
     let mut items: Vec<fly::MItem> = i18n::style::ALL.iter().zip(names).map(|(&s, n)| fly::MItem::new(n).on(s == style())).collect();
     items.push(fly::MItem::new(t!("Разложить окна плиткой", "Tile the windows")).sep());
     let head = (null_mut(), "\u{E713}", t!("Стиль", "Style").to_string(), t!("Вид панели и программ WinRust", "Look of the bar and the WinRust programs").to_string());
-    fly::menu(tip_cx(&bar_layout(bar), GEAR), Some(head), items, move |i| match i18n::style::ALL.get(i) {
+    fly::menu(cx, Some(head), items, move |i| match i18n::style::ALL.get(i) {
         Some(&s) => {
             i18n::style::set_style(s);
             place(bar);
         }
         None => tile_windows(),
+    });
+}
+
+/// The next value after `cur` in `list`, wrapping around: a click on a number setting steps through its choices.
+fn next_of(list: &[i64], cur: i64) -> i64 {
+    list.iter().copied().find(|&v| v > cur).unwrap_or(list[0])
+}
+
+/// The bar's settings (right-click menu > Bar settings): every switch is saved to config.txt and applied at once; the
+/// menu comes back after a click so several can be changed in a row.
+unsafe fn settings_menu(cx: i32) {
+    use winrust_common::config;
+    let c = cfg();
+    let secs = if c.desk_s >= 60 { tf!("{} мин", "{} min", c.desk_s / 60) } else { tf!("{} с", "{} s", c.desk_s) };
+    let items = vec![
+        fly::MItem::new(t!("Автоскрытие панели", "Auto-hide the bar")).on(c.autohide),
+        fly::MItem::new(t!("Кнопки слева", "Buttons on the left")).on(c.left),
+        fly::MItem::new(t!("Названия окон на кнопках", "Window titles on buttons")).on(c.labels),
+        fly::MItem::new(t!("Ширина кнопки", "Button width")).hint(format!("{} px", c.label_w)),
+        fly::MItem::new(t!("Кнопка поиска", "Search button")).on(c.search),
+        fly::MItem::new(t!("Шестерёнка на панели", "Gear on the bar")).on(c.gear),
+        fly::MItem::new(t!("Скрывать значки рабочего стола", "Auto-hide desktop icons")).on(c.desk_icons).sep(),
+        fly::MItem::new(t!("Скрывать через", "Hide them after")).hint(secs),
+        fly::MItem::new(t!("Открыть файл настроек", "Open the settings file")).sep(),
+    ];
+    let head = (null_mut(), "\u{E713}", t!("Настройки панели", "Bar settings").to_string(), t!("Сохраняются в config.txt", "Saved in config.txt").to_string());
+    fly::menu(cx, Some(head), items, move |i| {
+        let flip = |key: &str, on: bool| config::set(key, if on { "0" } else { "1" });
+        match i {
+            0 => flip("topbar.autohide", c.autohide),
+            1 => config::set("topbar.align", if c.left { "center" } else { "left" }),
+            2 => flip("topbar.labels", c.labels),
+            3 => config::set("topbar.label_width", &next_of(&[120, 160, 200, 240, 300], c.label_w as i64).to_string()),
+            4 => flip("topbar.search", c.search),
+            5 => flip("topbar.gear", c.gear),
+            6 => flip("desktop.autohide_icons", c.desk_icons),
+            7 => config::set("desktop.icons_delay_s", &next_of(&[2, 5, 10, 30, 60, 300], c.desk_s as i64).to_string()),
+            _ => {
+                if let Some(f) = config::ensure() {
+                    open(&wide(&f.to_string_lossy()));
+                }
+                return;
+            }
+        }
+        cfg_apply(BAR.load(Relaxed) as HWND);
+        settings_menu(cx);
+    });
+}
+
+/// Start's settings (right-click menu > Start menu): which buttons sit at its bottom, whether they hide behind one
+/// power button, and taking over what is pinned in Windows.
+unsafe fn start_menu(cx: i32) {
+    use winrust_common::config;
+    let c = cfg();
+    let mut items: Vec<fly::MItem> = (0..fly::POWER.len()).map(|i| fly::MItem::new(fly::power_label(i as u8)).on(c.power & 1 << i != 0)).collect();
+    items.push(fly::MItem::new(t!("Одна кнопка с меню", "One button with a menu")).on(c.power_menu).sep());
+    items.push(fly::MItem::new(t!("Импорт закреплённого из Windows", "Import what Windows has pinned")).sep());
+    let head = (null_mut(), "\u{E7E8}", t!("Меню «Пуск»", "Start menu").to_string(), t!("Кнопки внизу и закреплённые", "Its buttons and pinned apps").to_string());
+    fly::menu(cx, Some(head), items, move |i| {
+        if i < fly::POWER.len() {
+            let mask = c.power ^ 1 << i;
+            config::set("start.buttons", &fly::power_names(mask));
+        } else if i == fly::POWER.len() {
+            config::set("start.power_menu", if c.power_menu { "0" } else { "1" });
+        } else {
+            fly::start_import(); // Start opens with the result
+            return;
+        }
+        cfg_apply(BAR.load(Relaxed) as HWND);
+        start_menu(cx);
     });
 }
 
@@ -2261,9 +2571,12 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         LANG if left => lang_menu(BAR.load(Relaxed) as HWND),
         LANG => next_lang(BAR.load(Relaxed) as HWND),
         WIFI_I => fly::toggle(if left { fly::Kind::Quick } else { fly::Kind::Wifi }), // right click: the network list
+        VOL_I if mid => toggle_mute(),
+        VOL_I if !left => fly::toggle(fly::Kind::Sound), // right click: devices and the microphone
         VOL_I | BAT_I => fly::toggle(fly::Kind::Quick),
         CLOCK if left => fly::toggle(fly::Kind::Cal),
-        GEAR => style_menu(),
+        GEAR if left => style_menu(tip_cx(&bar_layout(BAR.load(Relaxed) as HWND), GEAR)),
+        GEAR => settings_menu(tip_cx(&bar_layout(BAR.load(Relaxed) as HWND), GEAR)),
         TAPP..=-900 => {
             let slot = (h - TAPP) as usize;
             if slot == 0 {
@@ -2293,6 +2606,16 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
                     open(l)
                 }),
                 (Some(&w), false) => close_window(w), // right / middle click
+                // Shift+click, like the Windows taskbar: start the app once more. Whether that gives a new window is up
+                // to the app. Not for apps that live in a host process (Store apps): starting the host opens nothing.
+                (Some(&w), true) if GetKeyState(VK_SHIFT as i32) < 0 => {
+                    let exe = exe_of(w);
+                    match &lnk {
+                        Some(l) => open(l),
+                        None if !exe.is_empty() && !HOSTS.iter().any(|h| exe.rsplit('\\').next() == Some(*h)) => open(&wide(&exe)),
+                        None => {}
+                    }
+                }
                 (Some(&w), true) => {
                     // like the Windows taskbar: the active app's button minimizes it, a minimized one restores, any other raises
                     let fg = GetForegroundWindow();
@@ -2324,26 +2647,29 @@ unsafe fn min_rect(info: *mut ShellHookInfo, bar: HWND) {
     let (w, l) = ((*info).hwnd, bar_layout(bar));
     let exe = exe_of(w);
     let i = BTNS.with_borrow(|b| b.iter().position(|b| b.wins.contains(&w)).or_else(|| b.iter().position(|b| !exe.is_empty() && b.wins.first().is_some_and(|&x| exe_of(x) == exe))));
-    let x = match i {
-        Some(i) => l.x0 + (i as i32 + 1) * (l.bw + l.gap),
-        None => (l.x0 + l.apps.0) / 2, // no button (yet): the middle of the bar
+    let (x, bw) = match i {
+        Some(i) => l.btn(i),
+        None => ((l.slots.first().map_or(0, |s| s.0) + l.apps.0) / 2, sc(44)), // no button (yet): the middle of the bar
     };
     let (top, x) = (bar_top() + sc(4), x + bar_x_w().0);
-    (*info).rc = RECT { left: x, top, right: x + l.bw, bottom: top + bar_h() - sc(8) };
+    (*info).rc = RECT { left: x, top, right: x + bw, bottom: top + bar_h() - sc(8) };
 }
 
 /// Screen x of the middle of a bar element, for its tooltip and menus.
 unsafe fn tip_cx(l: &Layout, h: i32) -> i32 {
     bar_x_w().0 + match h {
         GEAR => sc(GEAR_X.0 + GEAR_X.1 / 2),
-        SEARCH => l.x0 + l.bw / 2,
+        SEARCH => l.search_at().map_or(0, |(x, w)| x + w / 2),
         CLOCK => (l.clock.0 + l.clock.1) / 2,
         LANG => l.sys.0 + sc(21),
-        WIFI_I => l.sys.0 + sc(58),
-        VOL_I => l.sys.0 + sc(90),
-        BAT_I => l.sys.0 + sc(130),
+        WIFI_I => l.sys.0 + l.lang_w + sc(17),
+        VOL_I => l.sys.0 + l.lang_w + sc(51),
+        BAT_I => l.sys.0 + l.lang_w + sc(110),
         t if (TAPP..TAPP + 100).contains(&t) => l.apps.0 + (t - TAPP) * sc(24) + sc(12),
-        i => l.x0 + (i + 1) * (l.bw + l.gap) + l.bw / 2,
+        i => {
+            let (x, w) = l.btn(i.max(0) as usize);
+            x + w / 2
+        }
     }
 }
 
@@ -2371,6 +2697,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         return 0;
     }
+    if msg != 0 && msg == winrust_common::config::msg() {
+        winrust_common::config::reload(); // another WinRust program (or a hand edit announced by one) changed a setting
+        cfg_apply(hwnd);
+        return 0;
+    }
     if msg != 0 && msg == TB_MSG.get() {
         // also our own announce(): act only when explorer's taskbar is a new window (explorer restarted / came back)
         let t = tray()[0];
@@ -2392,7 +2723,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_TIMER if wp == 6 => hide_tip(hwnd), // the volume readout after a wheel turn
-        WM_TIMER if wp == 3 => fs_update(hwnd),
+        WM_TIMER if wp == 3 => {
+            fs_update(hwnd);
+            desk::tick();
+        }
+        DESK_CLICK => desk::clicked(POINT { x: wp as isize as i32, y: lp as i32 }),
+        IMPORT_DONE => fly::import_done(wp),
         WM_TIMER if wp == 7 => {
             KillTimer(hwnd, 7);
             let (tid, before) = LANG_TRY.get();
@@ -2417,6 +2753,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DROPFILES => on_drop(hwnd, wp as HDROP),
         WM_TIMER => {
             hide_taskbar_if_shown();
+            cfg_apply(hwnd); // a hand edit of config.txt is picked up here
             refresh();
             // repaint (GDI+, the costly part) only when something shown changed; every 10th tick anyway as a safety net
             let (last, quiet) = SIG.get();
@@ -2462,8 +2799,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if h != NONE {
                 press(h);
             }
-            if h == NONE && msg == WM_RBUTTONDOWN {
-                fly::context_menu(x); // right click on an empty spot
+            if (h == NONE || h == 0) && msg == WM_RBUTTONDOWN {
+                fly::context_menu(bar_x_w().0 + x); // right click on an empty spot or on Start
             } else if h >= 1 && msg == WM_RBUTTONDOWN {
                 app_menu(hwnd, h);
             } else {
@@ -2488,6 +2825,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 set_work_area(RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) }); // ours: give the strip back
             }
             show_taskbar(OLD_STATE.get());
+            desk::restore(); // nobody would bring hidden desktop icons back at a click
             DestroyWindow(HOST.replace(null_mut()));
             announce(); // icons go back to explorer's tray
             PostQuitMessage(0);
@@ -2505,6 +2843,7 @@ fn main() {
                 set_work_area(RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) }); // a killed bar's reserved strip
             }
             announce(); // a killed bar took its tray icons with it; apps re-register with explorer
+            desk::restore(); // ...and may have left the desktop icons hidden
             return;
         }
         if std::env::args().any(|a| a == "--shot") {
@@ -2539,6 +2878,7 @@ fn main() {
         SCALE.set(GetDeviceCaps(dc, LOGPIXELSX as i32) as f32 / 96.0);
         ReleaseDC(null_mut(), dc);
         SHOWN.set(std::fs::read_to_string(appdata_file("topbar-tray.txt")).ok().map(|s| s.lines().map(str::to_string).collect()));
+        CFG.set(Cfg::load());
         load_pins();
         fly::init(GetModuleHandleW(null()));
         thread::spawn(fly::load_apps);
@@ -2590,11 +2930,26 @@ fn main() {
         SetTimer(hwnd, 1, 500, None);
         BAR.store(hwnd as isize, Relaxed);
         bar_anim(hwnd); // the bar slides in (it starts hidden above the screen)
-        SetTimer(hwnd, 3, 250, None); // fullscreen watch
+        SetTimer(hwnd, 3, if cfg().autohide { 100 } else { 250 }, None); // fullscreen, auto-hide and desktop icons watch
+        WANT_MOUSE.store(cfg().desk_icons, Relaxed);
         thread::spawn(|| {
-            if !SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), GetModuleHandleW(null()), 0).is_null() {
-                let mut m: MSG = zeroed();
-                while GetMessageW(&mut m, null_mut(), 0, 0) > 0 {}
+            let mut m: MSG = zeroed();
+            PeekMessageW(&mut m, null_mut(), WM_USER, WM_USER, PM_NOREMOVE); // gives the thread its message queue before its id is known
+            HOOK_TID.store(GetCurrentThreadId(), Relaxed);
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook), GetModuleHandleW(null()), 0);
+            let mut mouse: HHOOK = null_mut();
+            loop {
+                // the mouse hook comes and goes with the settings (every thread message is a reason to look again)
+                let want = WANT_MOUSE.load(Relaxed);
+                if want && mouse.is_null() {
+                    mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), GetModuleHandleW(null()), 0);
+                } else if !want && !mouse.is_null() {
+                    UnhookWindowsHookEx(mouse);
+                    mouse = null_mut();
+                }
+                if GetMessageW(&mut m, null_mut(), 0, 0) <= 0 {
+                    break;
+                }
             }
         });
         let mut m: MSG = zeroed();
@@ -2618,8 +2973,69 @@ mod tests {
         assert!(at(80, true) == Link::Wifi(80));
         assert!(at(80, false) == Link::NoInternet(80)); // wifi without a way out: the warning icon
         assert!(at(-1, true) == Link::Cable);
-        assert!(at(-1, false) == Link::Offline); // nothing at all: the crossed-out wifi icon
+        assert!(at(-1, false) == Link::Offline); // nothing at all: the crossed-out icon
+        super::ETHS.set(vec![super::net::Eth { name: "Ethernet".into(), desc: String::new(), bps: 0, ip: String::new() }]);
+        assert!(at(-1, false) == Link::CableNoInternet); // a cable with a link, but no way out
+        assert!(at(-1, true) == Link::Cable);
+        super::ETHS.set(vec![]);
         assert_eq!((arcs_lit(0), arcs_lit(40), arcs_lit(100)), (1, 2, 3));
+    }
+
+    #[test]
+    fn titled_buttons_give_way_before_the_icons() {
+        use super::slot_widths;
+        let row = [false, false, true, true];
+        assert_eq!(slot_widths(&row, 1000, 44, 160, 16, 4), [44, 44, 160, 160]); // room for all
+        assert_eq!(slot_widths(&row, 300, 44, 160, 16, 4), [44, 44, 100, 100]); // titles shrink, icons stay
+        assert_eq!(slot_widths(&row, 100, 44, 160, 16, 4), [22, 22, 22, 22]); // nothing fits: all shrink together
+        assert_eq!(slot_widths(&row, 10, 44, 160, 16, 4), [16, 16, 16, 16]); // ...but stay clickable
+        assert_eq!(slot_widths(&[], 100, 44, 160, 16, 4), Vec::<i32>::new());
+    }
+
+    /// A bar with Start, two pins (the second with a window) and one loose window.
+    fn sample_bar(c: super::Cfg) -> super::Layout {
+        use super::{BTNS, Btn, CFG, LANGS, Pin};
+        use std::ptr::null_mut;
+        let b = |pin, win: usize| Btn { pin, wins: if win == 0 { vec![] } else { vec![win as _] }, icon: null_mut(), title: String::new() };
+        super::PINS.set((0..2).map(|_| Pin { lnk: vec![0], target: String::new(), icon: null_mut() }).collect());
+        BTNS.set(vec![b(None, 0), b(Some(0), 0), b(Some(1), 7), b(None, 9)]);
+        LANGS.set(1);
+        CFG.set(c);
+        super::layout(1920)
+    }
+
+    #[test]
+    fn default_layout_is_centered_with_search_first() {
+        let l = sample_bar(super::Cfg::DEFAULT);
+        assert_eq!((l.search, l.slots.len()), (Some(0), 5));
+        assert!(l.slots.iter().all(|s| s.1 == 44)); // icons only
+        let (sx, _) = l.search_at().unwrap();
+        assert_eq!(sx + (4 * 48 - 4) / 2, 960); // search + Start + two pins sit in the middle of the screen
+        assert_eq!(l.btn(0).0, sx + 48); // Start right after search
+        assert_eq!((l.slot_hit(sx + 1), l.slot_hit(sx + 49), l.slot_hit(sx + 45), l.slot_hit(2)), (super::SEARCH, 0, super::NONE, super::NONE));
+        assert_eq!(l.lang_w, 0); // one keyboard layout: no language button
+        assert_eq!(l.sys.1 - l.sys.0, 68); // no battery: the pill holds the network and volume icons, nothing more
+    }
+
+    #[test]
+    fn left_layout_starts_in_the_corner_and_titles_widen_open_windows() {
+        let l = sample_bar(super::Cfg { left: true, labels: true, search: false, ..super::Cfg::DEFAULT });
+        assert_eq!(l.search, None);
+        if super::style() == super::Style::Dock {
+            return super::CFG.set(super::Cfg::DEFAULT); // the dock's round end pushes the row in: the numbers below are for a straight bar
+        }
+        assert_eq!(l.btn(0), (4, 44)); // Start in the corner
+        assert_eq!((l.btn(1).1, l.btn(2).1, l.btn(3).1), (44, 160, 160)); // a pin that is not running stays an icon
+        assert_eq!(l.slot_hit(5), 0);
+        let l = sample_bar(super::Cfg { left: true, ..super::Cfg::DEFAULT });
+        assert_eq!((l.search, l.btn(0).0, l.search_at().unwrap().0, l.btn(1).0), (Some(1), 4, 52, 100)); // Start, search, the rest
+        assert_eq!((l.slot_hit(53), l.slot_hit(101)), (super::SEARCH, 1));
+        super::CFG.set(super::Cfg::DEFAULT);
+    }
+
+    #[test]
+    fn number_settings_step_through_their_choices() {
+        assert_eq!((super::next_of(&[2, 5, 10], 5), super::next_of(&[2, 5, 10], 10), super::next_of(&[2, 5, 10], 7)), (10, 2, 10));
     }
 
     #[test]
