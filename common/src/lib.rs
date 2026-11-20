@@ -8,6 +8,7 @@ use std::{
     sync::atomic::{AtomicU8, Ordering::Relaxed},
 };
 
+pub mod config;
 pub mod desktop;
 pub mod mft;
 pub mod reg;
