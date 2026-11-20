@@ -48,7 +48,7 @@ Every change is reversible: uninstall puts back the values that were there befor
 
 ## Styles
 
-The gear at the left end of the bar opens **Style**. The choice applies at once to the bar, the file manager (rust-explorer) and the search window (Alt+Space):
+**Style** is in the bar's right-click menu. The choice applies at once to the bar, the file manager (rust-explorer) and the search window (Alt+Space):
 
 | Style | Look |
 |---|---|
@@ -58,6 +58,40 @@ The gear at the left end of the bar opens **Style**. The choice applies at once 
 | **Tiling** | A thin bar at the top, amber accent, square corners; "Tile the windows" puts the open windows side by side |
 
 The choice is stored in `%ProgramData%\WinRust\style.txt`.
+
+## Settings
+
+Right-click an empty spot of the bar (or the Start button). **Bar settings**, **Start menu** and **Style** are submenus there; a switch applies at once and the menu stays open for the next one. Everything is kept in `%APPDATA%\WinRust\config.txt` as `key = value` lines, which you can also edit by hand ("Open the settings file" writes every key with an explanation). Saved edits apply within a second.
+
+| Key | Default | What it does |
+|---|---|---|
+| `topbar.autohide` | `0` | `1`: the bar slides away when the pointer leaves it and comes back at the screen edge. It then reserves no screen space, so nothing static stays on an OLED screen |
+| `topbar.autohide_delay_ms` | `800` | How long the bar stays after the pointer left it |
+| `topbar.align` | `center` | `left`: Start in the corner, then search and the app buttons |
+| `topbar.labels` | `0` | `1`: an open window gets a wide button with its title; apps that are only pinned stay icons |
+| `topbar.label_width` | `160` | Width of such a button (pixels at 100% scaling); they shrink when the bar is full |
+| `topbar.search` | `1` | `0`: no search button on the bar |
+| `topbar.gear` | `0` | `1`: a gear button at the left end (left click: Style, right click: Bar settings) |
+| `desktop.autohide_icons` | `0` | `1`: desktop icons are hidden until you click the desktop |
+| `desktop.icons_delay_s` | `5` | Seconds without mouse activity on the desktop after which the icons hide again |
+| `start.buttons` | `lock,sleep,restart,shutdown` | Buttons at the bottom of Start: any of `lock`, `signout`, `sleep`, `hibernate`, `restart`, `shutdown` |
+| `start.power_menu` | `0` | `1`: one power button that opens those actions as a menu |
+| `explorer.tabs` | `1` | `0`: the file manager has no tabs, one folder per window |
+
+Also on the bar:
+
+- **Start menu → Import what Windows has pinned** adds the Start tiles of Windows and the Quick Launch shortcuts to Start. Start's power buttons show a tooltip.
+- **Shift+click** an app's button starts the app once more (a new window, when the app supports it).
+- The language button shows only when more than one keyboard layout is installed.
+- **Network:** on a PC without Wi-Fi the icon, the quick panel's tile and the network panel are about the cable: connected or not, link speed, address, "no internet". With Wi-Fi, a wired connection is listed above the Wi-Fi networks.
+- **Bluetooth:** the quick panel's tile switches the radio and names the connected device; its arrow opens the Bluetooth settings.
+- **Sound:** right-click the volume icon (or the arrow next to the volume slider) for the sound panel: pick the output and the input device (it becomes the Windows default), microphone level and mute, links to the sound settings and the volume mixer. Middle click on the volume icon mutes.
+
+In the file manager and on the desktop:
+
+- **Right-click menus are WinRust's own:** open (in a new tab or window), run as administrator, cut / copy / paste, copy as path, rename, delete, properties. "Pin to Quick access" and "Add to Start" act on WinRust's lists, not on Explorer's. **More options…** shows the stock Windows menu with its extensions (7-Zip, Git, Open with).
+- **Quick access** in the left pane starts as a copy of the folders pinned in Windows and is yours from then on: right-click a folder to pin or unpin it, right-click it in the pane to move it up or down. The list is `%APPDATA%\rust-explorer\quick-access.txt`, one folder per line.
+- **Tabs** can be switched off: right-click the top of the window or the folder background → Tabs (the `explorer.tabs` key). Ctrl+T then opens a new window.
 
 ## Benchmark
 
