@@ -89,7 +89,7 @@ Also on the bar:
 
 In the file manager and on the desktop:
 
-- **Right-click menus are WinRust's own:** open (in a new tab or window), run as administrator, cut / copy / paste, copy as path, rename, delete, properties. "Pin to Quick access" and "Add to Start" act on WinRust's lists, not on Explorer's. **More options…** shows the stock Windows menu with its extensions (7-Zip, Git, Open with).
+- **Right-click menus are WinRust's own:** open (in a new tab or window), run as administrator, cut / copy / paste, copy as path, rename, delete, properties. "Pin to Quick access" and "Add to Start" act on WinRust's lists, not on Explorer's. The **Context menu** submenu holds what Windows itself would add for that file or folder: the entries from the registry and from installed extensions (Open with, Send to, Edit, Print, 7-Zip, Git…).
 - **Quick access** in the left pane starts as a copy of the folders pinned in Windows and is yours from then on: right-click a folder to pin or unpin it, right-click it in the pane to move it up or down. The list is `%APPDATA%\rust-explorer\quick-access.txt`, one folder per line.
 - **Tabs** can be switched off: right-click the top of the window or the folder background → Tabs (the `explorer.tabs` key). Ctrl+T then opens a new window.
 

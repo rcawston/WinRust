@@ -1,7 +1,8 @@
 //! Our own right-click menus: the selection, the folder background, the left pane and the tab strip. Plain popup menus
 //! (dark through ui::dark_mode). "Pin to Quick access" and "Add to Start" act on our lists (quick.rs), not on Explorer's.
-//! The stock shell menu with its extensions (7-Zip, Git, Open with) is one click away behind "More options…".
-//! shortcuts: no icons, no submenus ("New" is two entries), no keyboard accelerators in the labels.
+//! The stock Windows entries (what the registry and shell extensions add: Open with, Send to, 7-Zip, Git) are the
+//! "Context menu" submenu, filled when it opens (sh::stock_menu).
+//! shortcuts: no icons, no submenus of our own ("New" is two entries), no keyboard accelerators in the labels.
 #![allow(unsafe_op_in_unsafe_fn)]
 use super::*;
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
@@ -36,7 +37,7 @@ fn label(c: Cmd) -> &'static str {
         Cmd::AddStart => t!("Добавить в «Пуск»", "Add to Start"),
         Cmd::RemoveStart => t!("Убрать из «Пуска»", "Remove from Start"),
         Cmd::Props => t!("Свойства", "Properties"),
-        Cmd::More => t!("Другие параметры…", "More options…"),
+        Cmd::More => t!("Контекстное меню", "Context menu"),
         Cmd::NewFolder => t!("Создать папку", "New folder"),
         Cmd::NewFile => t!("Создать текстовый документ", "New text file"),
         Cmd::Refresh => t!("Обновить", "Refresh"),
@@ -122,19 +123,28 @@ fn as_path_text(paths: &[String]) -> String {
     paths.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join("\r\n")
 }
 
-/// Verbs of the stock shell menu that pin to Explorer's own Quick access / Start. They are taken out of "More options…":
-/// ours are in our menu, and Explorer's lists are not the ones shown here.
-pub fn os_pin_verb(verb: &str) -> bool {
-    matches!(verb.to_ascii_lowercase().as_str(), "pintohome" | "unpinfromhome" | "pintostartscreen" | "unpinfromstartscreen" | "startpin" | "startunpin")
+/// Verbs of the stock shell menu that are left out of the "Context menu" submenu: the ones that pin to Explorer's own
+/// Quick access / Start (ours are in our menu, and Explorer's lists are not the ones shown here), and the ones our menu
+/// has itself, one level up.
+pub fn stock_hidden(verb: &str) -> bool {
+    matches!(
+        verb.to_ascii_lowercase().as_str(),
+        "pintohome" | "unpinfromhome" | "pintostartscreen" | "unpinfromstartscreen" | "startpin" | "startunpin" | "open" | "cut" | "copy" | "paste" | "delete" | "rename" | "properties" | "copyaspath" | "refresh"
+    )
 }
 
 // ---------- showing a menu and doing what was picked ----------
 
-/// Shows `cmds` as a popup (at `at`, else at the pointer) and returns the entry picked.
-unsafe fn pick(h: HWND, cmds: &[Cmd], at: Option<POINT>, checked: &[Cmd], grey: &[Cmd]) -> Option<Cmd> {
+/// Shows `cmds` as a popup (at `at`, else at the pointer) and returns the entry picked. `stock`: what Cmd::More, the
+/// "Context menu" submenu, holds the stock Windows entries of; one of those picked is run here and comes back as Cmd::More.
+unsafe fn pick(h: HWND, cmds: &[Cmd], at: Option<POINT>, checked: &[Cmd], grey: &[Cmd], mut stock: Option<sh::Stock>) -> Option<Cmd> {
     let m = CreatePopupMenu();
     for (i, &c) in cmds.iter().enumerate() {
         if c == Cmd::Sep { AppendMenuW(m, MF_SEPARATOR, 0, ptr::null()); continue; }
+        if c == Cmd::More {
+            if let Some(sub) = stock.take().and_then(|s| sh::stock_menu(h as _, s)) { AppendMenuW(m, MF_POPUP, sub as usize, w(label(c)).as_ptr()); }
+            continue;
+        }
         let flags = MF_STRING | if checked.contains(&c) { MF_CHECKED } else { 0 } | if grey.contains(&c) { MF_GRAYED } else { 0 };
         AppendMenuW(m, flags, i + 1, w(label(c)).as_ptr());
     }
@@ -142,7 +152,9 @@ unsafe fn pick(h: HWND, cmds: &[Cmd], at: Option<POINT>, checked: &[Cmd], grey: 
     if at.is_none() { GetCursorPos(&mut pt); }
     SetForegroundWindow(h); // or a click elsewhere would not close the menu
     let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
+    let stock_ran = sh::stock_done(id as u32);
     DestroyMenu(m);
+    if stock_ran { return Some(Cmd::More); }
     cmds.get((id as usize).wrapping_sub(1)).copied()
 }
 
@@ -173,7 +185,7 @@ pub unsafe fn items(h: HWND, at: Option<POINT>) {
         clip: paths.len() == 1 && dirs && sh::clip_get().is_some(),
         tabs: tabs_on(), desk: desk(),
     };
-    let Some(cmd) = pick(h, &item_cmds(&s), at, &[], &[]) else { return };
+    let Some(cmd) = pick(h, &item_cmds(&s), at, &[], &[], Some(sh::Stock::Items(paths.clone()))) else { return };
     match cmd {
         Cmd::Open => {
             // files with their programs; the first folder here (the desktop: in a window), further folders next to it
@@ -199,7 +211,7 @@ pub unsafe fn items(h: HWND, at: Option<POINT>) {
         Cmd::Unpin => quick::edit(|v| strs.iter().fold(false, |ch, p| quick::remove(v, p) | ch)),
         Cmd::AddStart | Cmd::RemoveStart => quick::start_set(&strs, cmd == Cmd::AddStart),
         Cmd::Props => if paths.len() == 1 { properties(&paths[0]) } else { let _ = sh::properties(h, &paths); },
-        Cmd::More => { let _ = sh::show(h, &paths); reload(h); }
+        Cmd::More => reload(h), // a stock entry ran (pick did it): it may have changed the folder
         _ => {}
     }
 }
@@ -212,7 +224,7 @@ pub unsafe fn background(h: HWND) {
     let cmds = bg_cmds(desk(), !desk() && quick::pinned(&here), disk.is_some());
     let checked: &[Cmd] = if tabs_on() { &[Cmd::Tabs] } else { &[] };
     let grey: &[Cmd] = if sh::clip_get().is_some() { &[] } else { &[Cmd::Paste] };
-    let Some(cmd) = pick(h, &cmds, None, checked, grey) else { return };
+    let Some(cmd) = pick(h, &cmds, None, checked, grey, Some(sh::Stock::Folder(dir.clone()))) else { return };
     match cmd {
         Cmd::NewFolder => new_entry(&dir, "New folder", true),
         Cmd::NewFile => new_entry(&dir, "New text document.txt", false),
@@ -227,7 +239,7 @@ pub unsafe fn background(h: HWND) {
             return;
         }
         Cmd::Props => return properties(&dir),
-        Cmd::More => { let _ = sh::show_bg(h, &dir); }
+        Cmd::More => {} // a stock entry ran
         _ => return,
     }
     reload(h);
@@ -238,7 +250,7 @@ pub unsafe fn nav(h: HWND, idx: isize) {
     let list = quick::load();
     let Some(path) = usize::try_from(idx).ok().and_then(ui::nav_path) else {
         let here = text_of(&cur_dir());
-        match pick(h, &[if quick::find(&list, &here).is_some() { Cmd::UnpinHere } else { Cmd::PinHere }], None, &[], &[]) {
+        match pick(h, &[if quick::find(&list, &here).is_some() { Cmd::UnpinHere } else { Cmd::PinHere }], None, &[], &[], None) {
             Some(Cmd::PinHere) => quick::edit(|v| quick::add(v, &here)),
             Some(Cmd::UnpinHere) => quick::edit(|v| quick::remove(v, &here)),
             _ => {}
@@ -250,7 +262,7 @@ pub unsafe fn nav(h: HWND, idx: isize) {
     let mut grey = vec![];
     if at == Some(0) { grey.push(Cmd::Up); }
     if at.is_some_and(|i| i + 1 == list.len()) { grey.push(Cmd::Down); }
-    let Some(cmd) = pick(h, &nav_cmds(at.is_some(), tabs_on()), None, &[], &grey) else { return };
+    let Some(cmd) = pick(h, &nav_cmds(at.is_some(), tabs_on()), None, &[], &grey, None) else { return };
     match cmd {
         Cmd::Open => load(h, path),
         Cmd::NewTab => tab_open(h, path),
@@ -274,7 +286,7 @@ pub unsafe fn chrome(h: HWND, tab: isize) {
         cmds.push(Cmd::Sep);
     }
     cmds.push(Cmd::Tabs);
-    match pick(h, &cmds, None, if on { &[Cmd::Tabs] } else { &[] }, &[]) {
+    match pick(h, &cmds, None, if on { &[Cmd::Tabs] } else { &[] }, &[], None) {
         Some(Cmd::TabNew) => tab_new(),
         Some(Cmd::TabClose) => tab_close_at(h, tab as usize),
         Some(Cmd::Tabs) => set_tabs(h, !on),
@@ -338,7 +350,9 @@ mod tests {
     fn helpers() {
         assert_eq!(as_path_text(&["C:\\a b\\c.txt".into(), "D:\\x".into()]), "\"C:\\a b\\c.txt\"\r\n\"D:\\x\"");
         assert!(runnable(Path::new("C:\\a\\Setup.EXE")) && runnable(Path::new("x.lnk")) && !runnable(Path::new("x.txt")));
-        assert!(os_pin_verb("PinToHome") && os_pin_verb("unpinfromstartscreen") && !os_pin_verb("properties") && !os_pin_verb("taskbarpin"));
-        assert_eq!(label(More), "Другие параметры…"); // tests run in Russian
+        // Explorer's own pins and what our menu has itself stay out of the submenu; what extensions and file types add stays in
+        assert!(stock_hidden("PinToHome") && stock_hidden("unpinfromstartscreen") && stock_hidden("properties") && stock_hidden("Copy"));
+        assert!(!stock_hidden("taskbarpin") && !stock_hidden("edit") && !stock_hidden("print") && !stock_hidden("openas") && !stock_hidden(""));
+        assert_eq!(label(More), "Контекстное меню"); // tests run in Russian
     }
 }

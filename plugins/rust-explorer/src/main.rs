@@ -1,7 +1,7 @@
 // rust-explorer [path]  — file manager window (Explorer replacement).
 // Virtual list (LVS_OWNERDATA, only visible rows are asked for text/icon), system icons, tabs,
-// IFileOperation (recycle bin / undo / elevation prompts), own right-click menus (src/menu.rs; the real shell menu with
-// its submenus is their last entry, "More options…"), own Quick access list in the left pane (src/quick.rs), OLE drag and drop.
+// IFileOperation (recycle bin / undo / elevation prompts), own right-click menus (src/menu.rs; what the shell itself
+// would offer is their last entry, the "Context menu" submenu), own Quick access list in the left pane (src/quick.rs), OLE drag and drop.
 // Keys: Enter open, Backspace up, F2 rename, Del recycle, Ctrl+C/X/V copy/cut/paste, Ctrl+N new folder,
 // Ctrl+T/W/Tab tabs, Ctrl+M thumbnails, Ctrl+L/F4 address bar, Ctrl+F or "? terms" in the bar = instant search through the rs service, right click / Menu key = context menu,
 // middle click on a folder = open it in a new tab.
@@ -640,48 +640,121 @@ mod sh {
 
     thread_local! { static CM2: RefCell<Option<IContextMenu2>> = const { RefCell::new(None) }; }
 
-    /// Forwards owner-draw / init-popup menu messages so submenus like "Send to" get filled in.
-    pub fn menu_msg(m: u32, wp: usize, lp: isize) -> bool {
-        CM2.with_borrow(|c| c.as_ref().is_some_and(|c| unsafe { c.HandleMenuMsg(m, WPARAM(wp), LPARAM(lp)).is_ok() }))
+    /// What the stock Windows menu is asked for: the selected items, or a folder's own background.
+    pub enum Stock { Items(Vec<PathBuf>), Folder(PathBuf) }
+
+    /// The "Context menu" submenu of our own menus: the stock Windows entries (what the registry and the installed
+    /// shell extensions add: Open with, Send to, 7-Zip, Git...). It starts empty and is filled when it opens: asking
+    /// the shell loads every extension, too slow to pay on each right click.
+    struct Lazy { hwnd: HWND, sub: HMENU, of: Stock, cm: Option<IContextMenu>, tried: bool }
+    thread_local! { static LAZY: RefCell<Option<Lazy>> = const { RefCell::new(None) }; }
+
+    /// First command id of the stock entries (our own entries are small numbers).
+    pub const STOCK_FIRST: u32 = 0x1000;
+
+    /// The still empty submenu for `of`, to hang under one of our menus (owner window `h`). None = no menu could be made.
+    pub fn stock_menu(h: *mut c_void, of: Stock) -> Option<*mut c_void> {
+        let sub = unsafe { CreatePopupMenu() }.ok()?;
+        LAZY.set(Some(Lazy { hwnd: HWND(h), sub, of, cm: None, tried: false }));
+        Some(sub.0)
     }
 
-    /// The real shell context menu for `paths`, so 7-Zip/Git/etc. entries show up ("More options…" of our own menu).
-    pub fn show(h: *mut c_void, paths: &[PathBuf]) -> Result<()> {
-        unsafe { track(HWND(h), &ui(HWND(h), paths)?) }
-    }
-
-    /// The real shell menu of a folder's background (its "New" submenu with every registered file type, extensions).
-    pub fn show_bg(h: *mut c_void, dir: &PathBuf) -> Result<()> {
+    /// Fills the submenu from the shell. Left out: what our own menu already offers, and the entries that pin to
+    /// Explorer's Quick access / Start (see menu::stock_hidden); separators left without neighbours go too.
+    unsafe fn fill(l: &mut Lazy) -> Result<()> {
         unsafe {
-            let folder: IShellFolder = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(dir).as_ptr()), None)?.BindToHandler(None, &BHID_SFObject)?;
-            track(HWND(h), &folder.CreateViewObject(HWND(h))?)
-        }
-    }
-
-    /// Shows a shell menu at the pointer and runs what is picked. The entries that pin to Explorer's own Quick access /
-    /// Start are taken out first (see menu::os_pin_verb): ours are in our own menu.
-    unsafe fn track(hwnd: HWND, cm: &IContextMenu) -> Result<()> {
-        unsafe {
-            let menu = CreatePopupMenu()?;
-            cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok()?;
-            for i in (0..GetMenuItemCount(Some(menu))).rev() {
-                let id = GetMenuItemID(menu, i);
-                if id == 0 || id > 0x7FFF { continue; } // a separator or a submenu
+            let cm: IContextMenu = match &l.of {
+                Stock::Items(paths) => ui(l.hwnd, paths)?,
+                Stock::Folder(dir) => SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(dir).as_ptr()), None)?.BindToHandler::<_, IShellFolder>(None, &BHID_SFObject)?.CreateViewObject(l.hwnd)?,
+            };
+            cm.QueryContextMenu(l.sub, 0, STOCK_FIRST, 0x7FFF, CMF_NORMAL).ok()?;
+            for i in (0..GetMenuItemCount(Some(l.sub))).rev() {
+                let id = GetMenuItemID(l.sub, i);
+                if !(STOCK_FIRST..=0x7FFF).contains(&id) { continue; } // a separator or a submenu
                 let mut verb = [0u16; 260];
-                if cm.GetCommandString(id as usize - 1, GCS_VERBW, None, PSTR(verb.as_mut_ptr() as *mut u8), 259).is_ok() && super::menu::os_pin_verb(&super::wstr(verb.as_ptr())) {
-                    let _ = DeleteMenu(menu, i as u32, MF_BYPOSITION);
+                if cm.GetCommandString((id - STOCK_FIRST) as usize, GCS_VERBW, None, PSTR(verb.as_mut_ptr() as *mut u8), 259).is_ok() && super::menu::stock_hidden(&super::wstr(verb.as_ptr())) {
+                    let _ = DeleteMenu(l.sub, i as u32, MF_BYPOSITION);
+                }
+            }
+            let sep = |i: i32| GetMenuState(l.sub, i as u32, MF_BYPOSITION) & MF_SEPARATOR.0 != 0;
+            for i in (0..GetMenuItemCount(Some(l.sub))).rev() {
+                if sep(i) && (i == 0 || i == GetMenuItemCount(Some(l.sub)) - 1 || sep(i - 1)) {
+                    let _ = DeleteMenu(l.sub, i as u32, MF_BYPOSITION);
                 }
             }
             CM2.set(cm.cast::<IContextMenu2>().ok());
-            let mut pt = POINT::default();
-            GetCursorPos(&mut pt)?;
-            let id = TrackPopupMenuEx(menu, TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0, pt.x, pt.y, hwnd, None).0;
-            CM2.set(None);
-            if id > 0 {
-                let ci = CMINVOKECOMMANDINFO { cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32, hwnd, lpVerb: PCSTR((id - 1) as usize as *const u8), nShow: SW_SHOWNORMAL.0, ..Default::default() };
-                cm.InvokeCommand(&ci)?;
+            l.cm = Some(cm);
+            Ok(())
+        }
+    }
+
+    /// Menu messages of the window that owns our menu: the "Context menu" submenu is filled when it is about to open;
+    /// owner-draw / init-popup messages go on to the shell so its own submenus like "Send to" get filled in.
+    pub fn menu_msg(m: u32, wp: usize, lp: isize) -> bool {
+        // taken out while the shell works: an extension may pump messages that come back into here
+        if let Some(mut l) = if m == WM_INITMENUPOPUP { LAZY.take() } else { None } {
+            let ours = l.sub.0 as usize == wp && !l.tried;
+            if ours {
+                l.tried = true;
+                unsafe {
+                    if fill(&mut l).is_err() || GetMenuItemCount(Some(l.sub)) <= 0 {
+                        let _ = AppendMenuW(l.sub, MF_STRING | MF_GRAYED, 0, PCWSTR(super::w(t!("(пусто)", "(nothing here)")).as_ptr()));
+                    }
+                }
             }
-            DestroyMenu(menu)
+            LAZY.set(Some(l));
+            if ours { return true; }
+        }
+        CM2.with_borrow(|c| c.as_ref().is_some_and(|c| unsafe { c.HandleMenuMsg(m, WPARAM(wp), LPARAM(lp)).is_ok() }))
+    }
+
+    /// Our menu has closed with command `id`: runs it when it is one of the stock entries (true), and lets go of the
+    /// shell's menu either way. The submenu itself is destroyed with the menu it hangs under.
+    pub fn stock_done(id: u32) -> bool {
+        CM2.set(None);
+        let Some(l) = LAZY.take() else { return false };
+        if id < STOCK_FIRST { return false; }
+        if let Some(cm) = &l.cm {
+            let ci = CMINVOKECOMMANDINFO { cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32, hwnd: l.hwnd, lpVerb: PCSTR((id - STOCK_FIRST) as usize as *const u8), nShow: SW_SHOWNORMAL.0, ..Default::default() };
+            let _ = unsafe { cm.InvokeCommand(&ci) };
+        }
+        true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn stock_submenu_of_a_real_file() {
+            // real system check: the shell fills our submenu for a file, nothing we hide is left in it and no
+            // separator opens, closes or doubles up
+            if std::env::var_os("CI").is_some() {
+                return; // a build agent's session has no interactive shell to ask
+            }
+            unsafe {
+                let _ = OleInitialize(None);
+                let file = std::env::temp_dir().join("rx-stock-menu-test.txt");
+                std::fs::write(&file, "x").unwrap();
+                let sub = CreatePopupMenu().unwrap();
+                let mut l = Lazy { hwnd: HWND(std::ptr::null_mut()), sub, of: Stock::Items(vec![file.clone()]), cm: None, tried: true };
+                fill(&mut l).unwrap();
+                let n = GetMenuItemCount(Some(sub));
+                assert!(n > 0, "the shell has entries for a text file");
+                let sep = |i: i32| GetMenuState(sub, i as u32, MF_BYPOSITION) & MF_SEPARATOR.0 != 0;
+                assert!(!sep(0) && !sep(n - 1) && (1..n).all(|i| !(sep(i) && sep(i - 1))));
+                let cm = l.cm.take().unwrap();
+                for i in 0..n {
+                    let id = GetMenuItemID(sub, i);
+                    let mut verb = [0u16; 260];
+                    let has = (STOCK_FIRST..=0x7FFF).contains(&id) && cm.GetCommandString((id - STOCK_FIRST) as usize, GCS_VERBW, None, PSTR(verb.as_mut_ptr() as *mut u8), 259).is_ok();
+                    let verb = if has { crate::wstr(verb.as_ptr()) } else { String::new() };
+                    assert!(!crate::menu::stock_hidden(&verb), "{verb}");
+                }
+                CM2.set(None);
+                let _ = DestroyMenu(sub);
+                let _ = std::fs::remove_file(file);
+            }
         }
     }
 
