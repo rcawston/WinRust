@@ -1,8 +1,12 @@
 // rust-explorer [path]  — file manager window (Explorer replacement).
 // Virtual list (LVS_OWNERDATA, only visible rows are asked for text/icon), system icons, tabs,
-// IFileOperation (recycle bin / undo / elevation prompts), real shell context menu with submenus, OLE drag and drop.
+// IFileOperation (recycle bin / undo / elevation prompts), own right-click menus (src/menu.rs; the real shell menu with
+// its submenus is their last entry, "More options…"), own Quick access list in the left pane (src/quick.rs), OLE drag and drop.
 // Keys: Enter open, Backspace up, F2 rename, Del recycle, Ctrl+C/X/V copy/cut/paste, Ctrl+N new folder,
-// Ctrl+T/W/Tab tabs, Ctrl+M thumbnails, Ctrl+L/F4 address bar, Ctrl+F or "? terms" in the bar = instant search through the rs service, right click / Menu key = shell context menu.
+// Ctrl+T/W/Tab tabs, Ctrl+M thumbnails, Ctrl+L/F4 address bar, Ctrl+F or "? terms" in the bar = instant search through the rs service, right click / Menu key = context menu,
+// middle click on a folder = open it in a new tab.
+// Tabs can be switched off (explorer.tabs = 0 in the shared WinRust settings, or "Tabs" in the folder's menu): one folder
+// per window, no tab strip, Ctrl+T opens a new window and Ctrl+W closes the window.
 // Look: topbar's palette, painted tabs / toolbar / address pill and status line (src/ui.rs), dark title bar and list.
 // Clipboard is the system one (Ctrl+C/X/V interoperate with Explorer). Also: Alt+Left/Right back/forward, Alt+Up up,
 // Alt+Enter properties, F5 refresh, Ctrl+H hidden files, click a column header to sort, right click on empty space = folder menu.
@@ -20,6 +24,12 @@
 use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}};
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{BLACK_BRUSH, GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL}, Shell::*, WindowsAndMessaging::*}};
 
+#[macro_use]
+extern crate winrust_common;
+use winrust_common::config;
+
+mod menu; // our own right-click menus
+mod quick; // our Quick access list (left pane) and the topbar's Start list
 mod ui; // the look: palette, painted tabs / toolbar / address pill / status line, dark theme
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
@@ -61,6 +71,8 @@ static SORT_ASC: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 static NAV: AtomicBool = AtomicBool::new(false); // loading from the back / forward trail: do not record it again
 const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (sent from the message loop for Alt+key)
+static TABS: AtomicBool = AtomicBool::new(true); // explorer.tabs of the shared settings; false = one folder per window, no tab strip
+pub fn tabs_on() -> bool { TABS.load(Relaxed) && !desk() }
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
     Row { name, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2 }
@@ -131,32 +143,6 @@ fn paste(h: HWND, dir: &PathBuf) {
     let Some((paths, cut)) = sh::clip_get() else { return };
     let _ = sh::fileop(h, if cut { sh::Op::Move } else { sh::Op::Copy }, &paths, dir);
     if cut { sh::clip_clear(); }
-}
-
-/// Right click on empty space: the folder's own menu.
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn bg_menu(h: HWND) {
-    let m = CreatePopupMenu();
-    for (id, t) in [(1usize, "New folder"), (2, "New text file"), (3, "Paste"), (4, "Refresh"), (5, "Properties")] { AppendMenuW(m, MF_STRING, id, w(t).as_ptr()); }
-    let disk = tool("wiztree");
-    if disk.is_some() { AppendMenuW(m, MF_STRING, 6, w("Disk usage (WinRust Disk)").as_ptr()); }
-    let mut pt: POINT = std::mem::zeroed();
-    GetCursorPos(&mut pt);
-    let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
-    DestroyMenu(m);
-    let dir = cur_dir();
-    match id {
-        6 => { // wiztree takes the drive letter and asks for admin rights itself
-            let drive: String = dir.to_string_lossy().chars().take(2).collect();
-            if let Some(exe) = disk { let _ = std::process::Command::new(exe).arg(drive).spawn(); }
-        }
-        1 => new_entry(&dir, "New folder", true),
-        2 => new_entry(&dir, "New text document.txt", false),
-        3 => paste(h, &dir),
-        5 => properties(&dir),
-        _ => {}
-    }
-    if id != 0 { reload(h); }
 }
 
 /// Back / forward along the visited-folder trail.
@@ -348,10 +334,59 @@ fn col(list: HWND, i: i32, text: &str, width: i32, right: bool) {
     put(list, LVM_INSERTCOLUMNW, i as usize, &c as *const _ as isize);
 }
 
-/// Opens a new tab on the current folder.
+/// A file manager window of its own on `dir`.
+fn new_window(dir: &Path) { let _ = std::process::Command::new(env::current_exe().unwrap_or_default()).arg(dir).spawn(); }
+
+/// Opens a new tab on the current folder; without tabs, a new window on it.
 fn tab_new() {
+    if !tabs_on() { return new_window(&cur_dir()); }
     let tab = ST.with_borrow_mut(|st| { st.tabs.push(st.dir.clone()); st.active = st.tabs.len() - 1; st.tab });
     tab_text(tab, 0, "", true);
+}
+
+/// Opens `dir` in a new tab and shows it. A folder that cannot be read gets no tab.
+fn tab_open(h: HWND, dir: PathBuf) {
+    if fs::read_dir(&dir).is_err() { return; }
+    ST.with_borrow_mut(|st| { st.tabs.push(dir.clone()); st.active = st.tabs.len() - 1; });
+    load(h, dir);
+}
+
+/// "Open in new tab" where there may be no tabs (switched off, the desktop): a new window then.
+fn open_new(h: HWND, dir: &Path) { if tabs_on() { tab_open(h, dir.to_path_buf()) } else { new_window(dir) } }
+
+/// Opens a file with its program (pictures in photoview when it is installed) or goes into a folder; the desktop opens
+/// a folder in a file manager window.
+fn open_item(h: HWND, p: &Path, is_dir: bool) {
+    if is_dir && desk() { new_window(p) }
+    else if is_dir { load(h, p.to_path_buf()) }
+    else if let Some(exe) = tool("photoview").filter(|_| is_pic(p)) { let _ = std::process::Command::new(exe).arg(p).spawn(); }
+    else { unsafe { ShellExecuteW(0 as _, ptr::null(), w(&p.to_string_lossy()).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL) }; }
+}
+
+/// Without tabs only the active one is left.
+fn keep_active(tabs: &mut Vec<PathBuf>, active: &mut usize) {
+    let keep = tabs.get(*active).cloned().unwrap_or_default();
+    *tabs = vec![keep];
+    *active = 0;
+}
+
+/// The tabs setting has a new value: the extra tabs go, and the top part lays out again with or without the strip.
+fn apply_tabs(h: HWND, on: bool) {
+    if TABS.swap(on, Relaxed) == on || desk() { return; }
+    let chrome = ST.with_borrow_mut(|st| { if !on { keep_active(&mut st.tabs, &mut st.active); } st.tab });
+    unsafe {
+        let mut r: RECT = std::mem::zeroed();
+        GetClientRect(h, &mut r);
+        ui::layout_children(r.right, r.bottom);
+        InvalidateRect(chrome, ptr::null(), 0);
+    }
+}
+
+/// Switches tabs on / off in the shared settings: this window follows at once, the other file manager windows on the
+/// settings broadcast.
+fn set_tabs(h: HWND, on: bool) {
+    config::set("explorer.tabs", if on { "1" } else { "0" });
+    apply_tabs(h, on);
 }
 
 fn tab_select(h: HWND, i: usize) {
@@ -434,7 +469,7 @@ mod wall {
 /// Shell integration through COM (windows crate): file operations, context menu, drag and drop.
 mod sh {
     use std::{cell::RefCell, ffi::c_void, os::windows::ffi::OsStrExt, path::PathBuf};
-    use windows::{core::*, Win32::{Foundation::*, System::{Com::*, DataExchange::RegisterClipboardFormatW, Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock}, Ole::*, SystemServices::MODIFIERKEYS_FLAGS}, UI::{Shell::{Common::ITEMIDLIST, *}, WindowsAndMessaging::*}}};
+    use windows::{core::*, Win32::{Foundation::*, System::{Com::*, DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData}, Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock}, Ole::*, SystemServices::{MODIFIERKEYS_FLAGS, SFGAO_FOLDER}}, UI::{Shell::{Common::ITEMIDLIST, PropertiesSystem::PSGetPropertyKeyFromName, *}, WindowsAndMessaging::*}}};
 
     #[derive(Clone, Copy)]
     pub enum Op { Copy, Move, Delete }
@@ -450,6 +485,29 @@ mod sh {
     }
 
     pub fn init() { unsafe { let _ = OleInitialize(None); } }
+
+    /// Folders pinned to Windows' own Quick access, in its order: what our list starts from (quick.rs). Its Home folder
+    /// lists the pinned and the frequent folders and the recent files; System.Home.IsPinned tells the pinned ones.
+    pub fn os_quick_access() -> Vec<String> {
+        let mut out = vec![];
+        unsafe {
+            let mut pinned = PROPERTYKEY::default();
+            if PSGetPropertyKeyFromName(w!("System.Home.IsPinned"), &mut pinned).is_err() { return out; }
+            let Ok(home) = SHCreateItemFromParsingName::<_, _, IShellItem>(w!("shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}"), None) else { return out };
+            let Ok(items) = home.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) else { return out };
+            loop {
+                let mut one = [None];
+                let _ = items.Next(&mut one, None);
+                let Some(it) = one[0].take() else { break };
+                if !it.cast::<IShellItem2>().and_then(|i| i.GetBool(&pinned)).is_ok_and(|b| b.as_bool()) { continue; }
+                if !it.GetAttributes(SFGAO_FOLDER).is_ok_and(|a| a.0 & SFGAO_FOLDER.0 != 0) { continue; }
+                let Ok(p) = it.GetDisplayName(SIGDN_FILESYSPATH) else { continue }; // not on a disk (a library, This PC)
+                if let Ok(s) = p.to_string() { out.push(s); }
+                CoTaskMemFree(Some(p.0 as *const c_void));
+            }
+        }
+        out
+    }
 
     fn wide(p: &PathBuf) -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() }
 
@@ -547,6 +605,21 @@ mod sh {
 
     pub fn clip_clear() { unsafe { let _ = OleSetClipboard(None); } }
 
+    /// Plain text on the clipboard ("Copy as path").
+    pub fn clip_text(h: *mut c_void, s: &str) -> Result<()> {
+        unsafe {
+            let u: Vec<u16> = s.encode_utf16().chain([0]).collect();
+            let hg = GlobalAlloc(GMEM_MOVEABLE, u.len() * 2)?;
+            std::ptr::copy_nonoverlapping(u.as_ptr(), GlobalLock(hg) as *mut u16, u.len());
+            let _ = GlobalUnlock(hg);
+            OpenClipboard(Some(HWND(h)))?;
+            let _ = EmptyClipboard();
+            let r = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hg.0))); // the clipboard owns the memory from here
+            let _ = CloseClipboard();
+            r.map(drop)
+        }
+    }
+
     struct Pidls(Vec<*mut ITEMIDLIST>);
     impl Drop for Pidls { fn drop(&mut self) { for p in &self.0 { unsafe { CoTaskMemFree(Some(*p as *const c_void)) }; } } }
 
@@ -572,13 +645,33 @@ mod sh {
         CM2.with_borrow(|c| c.as_ref().is_some_and(|c| unsafe { c.HandleMenuMsg(m, WPARAM(wp), LPARAM(lp)).is_ok() }))
     }
 
-    /// The real shell context menu for `paths`, so 7-Zip/Git/etc. entries show up.
+    /// The real shell context menu for `paths`, so 7-Zip/Git/etc. entries show up ("More options…" of our own menu).
     pub fn show(h: *mut c_void, paths: &[PathBuf]) -> Result<()> {
+        unsafe { track(HWND(h), &ui(HWND(h), paths)?) }
+    }
+
+    /// The real shell menu of a folder's background (its "New" submenu with every registered file type, extensions).
+    pub fn show_bg(h: *mut c_void, dir: &PathBuf) -> Result<()> {
         unsafe {
-            let hwnd = HWND(h);
-            let cm: IContextMenu = ui(hwnd, paths)?;
+            let folder: IShellFolder = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(dir).as_ptr()), None)?.BindToHandler(None, &BHID_SFObject)?;
+            track(HWND(h), &folder.CreateViewObject(HWND(h))?)
+        }
+    }
+
+    /// Shows a shell menu at the pointer and runs what is picked. The entries that pin to Explorer's own Quick access /
+    /// Start are taken out first (see menu::os_pin_verb): ours are in our own menu.
+    unsafe fn track(hwnd: HWND, cm: &IContextMenu) -> Result<()> {
+        unsafe {
             let menu = CreatePopupMenu()?;
             cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok()?;
+            for i in (0..GetMenuItemCount(Some(menu))).rev() {
+                let id = GetMenuItemID(menu, i);
+                if id == 0 || id > 0x7FFF { continue; } // a separator or a submenu
+                let mut verb = [0u16; 260];
+                if cm.GetCommandString(id as usize - 1, GCS_VERBW, None, PSTR(verb.as_mut_ptr() as *mut u8), 259).is_ok() && super::menu::os_pin_verb(&super::wstr(verb.as_ptr())) {
+                    let _ = DeleteMenu(menu, i as u32, MF_BYPOSITION);
+                }
+            }
             CM2.set(cm.cast::<IContextMenu2>().ok());
             let mut pt = POINT::default();
             GetCursorPos(&mut pt)?;
@@ -589,6 +682,20 @@ mod sh {
                 cm.InvokeCommand(&ci)?;
             }
             DestroyMenu(menu)
+        }
+    }
+
+    /// The shell's property sheet for several items at once (one item: super::properties).
+    pub fn properties(h: *mut c_void, paths: &[PathBuf]) -> Result<()> {
+        unsafe {
+            let hwnd = HWND(h);
+            let cm: IContextMenu = ui(hwnd, paths)?;
+            let menu = CreatePopupMenu()?; // the handlers want their menu built before a verb is run
+            let _ = cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL);
+            let ci = CMINVOKECOMMANDINFO { cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32, hwnd, lpVerb: s!("properties"), nShow: SW_SHOWNORMAL.0, ..Default::default() };
+            let r = cm.InvokeCommand(&ci);
+            let _ = DestroyMenu(menu);
+            r
         }
     }
 
@@ -927,6 +1034,17 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
             if desk() { InvalidateRect(h, ptr::null(), 1); } else { ui::restyle(h); }
             return 0;
         }
+        if m == config::msg() {
+            // a WinRust setting changed (here or in another program); ours is explorer.tabs
+            config::reload();
+            apply_tabs(h, config::flag("explorer.tabs"));
+            return 0;
+        }
+        if m == quick::msg() {
+            // some window pinned / unpinned / moved a Quick access folder
+            if !desk() { ui::nav_fill(); }
+            return 0;
+        }
         match m {
             WM_CREATE => {
                 let inst = GetModuleHandleW(ptr::null());
@@ -1009,6 +1127,12 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     9 => search_focus(),
                     20 => { if let Some(p) = ui::nav_path(lp as usize) { load(h, p); } } // a folder in the left pane
                     21 => { if let Some(p) = ui::crumb_path(lp as usize) { load(h, p); } } // a part of the path in the address pill
+                    22 => { // middle click on a row: a folder opens in a new tab (without tabs: a new window)
+                        let dir = ST.with_borrow(|st| st.rows.get(lp as usize).filter(|r| r.dir).map(|r| st.dir.join(&r.name)));
+                        if let Some(d) = dir { open_new(h, &d); }
+                    }
+                    23 => menu::nav(h, lp), // right click in the left pane
+                    30 => menu::chrome(h, lp), // right click on the tabs / toolbar
                     _ => {}
                 }
                 0
@@ -1057,17 +1181,9 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     LVN_ITEMACTIVATE => {
                         let i = (*(lp as *const NMITEMACTIVATE)).iItem;
                         let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).map(|r| (st.dir.join(&r.name), r.dir)));
-                        if let Some((p, is_dir)) = hit {
-                            if is_dir && desk() { let _ = std::process::Command::new(env::current_exe().unwrap_or_default()).arg(p).spawn(); }
-                            else if is_dir { load(h, p) }
-                            else if let Some(exe) = tool("photoview").filter(|_| is_pic(&p)) { let _ = std::process::Command::new(exe).arg(&p).spawn(); }
-                            else { ShellExecuteW(0 as _, ptr::null(), w(&p.to_string_lossy()).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL); }
-                        }
+                        if let Some((p, is_dir)) = hit { open_item(h, &p, is_dir); }
                     }
-                    NM_RCLICK if nm.hwndFrom == list => {
-                        let (_, _, paths) = selected();
-                        if !paths.is_empty() { let _ = sh::show(h, &paths); reload(h); } else { bg_menu(h); }
-                    }
+                    NM_RCLICK if nm.hwndFrom == list => menu::items(h, None), // nothing selected: the folder's menu
                     LVN_COLUMNCLICK => {
                         let c = (*(lp as *const NMLISTVIEW)).iSubItem as usize;
                         let asc = if SORT_COL.load(Relaxed) == c { !SORT_ASC.load(Relaxed) } else { true };
@@ -1113,15 +1229,15 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                                 put(edit, EM_SETSEL, 0, -1);
                                 return 0;
                             }
-                            0x5D if !paths.is_empty() => { let _ = sh::show(h, &paths); }
+                            0x5D => { menu::items(h, menu::at_selection(list)); return 0; } // Menu key
                             0x43 | 0x58 if ctrl && !paths.is_empty() => { let _ = sh::clip_set(h, &paths, vk == 0x58); return 0; }
                             0x56 if ctrl => paste(h, &dir),
                             0x4E if ctrl => new_entry(&dir, "New folder", true),
                             0x48 if ctrl => { SHOW_HIDDEN.fetch_xor(true, Relaxed); } // Ctrl+H: hidden files
                             0x74 => {} // F5: just the reload below
                             0x4D if ctrl => { toggle_view(h); return 0; } // Ctrl+M: details <-> thumbnails
-                            0x54 if ctrl => tab_new(),
-                            0x57 if ctrl => { tab_close(h); return 0; }
+                            0x54 if ctrl => { tab_new(); return 0; }
+                            0x57 if ctrl => { if tabs_on() { tab_close(h); } else { PostMessageW(h, WM_CLOSE, 0, 0); } return 0; } // no tabs: the window is the tab
                             0x09 if ctrl => {
                                 let next = ST.with_borrow(|st| (st.active + 1) % st.tabs.len());
                                 tab_select(h, next);
@@ -1137,7 +1253,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let new = wstr(it.pszText);
                             // reject separators so a rename can never move the item
                             if !new.is_empty() && !new.contains(['\\', '/', ':']) {
-                                ST.with_borrow(|st| if let Some(r) = usize::try_from(it.iItem).ok().and_then(|i| st.rows.get(i)) { let _ = fs::rename(st.dir.join(&r.name), st.dir.join(&new)); });
+                                ST.with_borrow(|st| if let Some(r) = usize::try_from(it.iItem).ok().and_then(|i| st.rows.get(i)) { let old = st.dir.join(&r.name); let _ = fs::rename(&old, old.with_file_name(&new)); }); // next to itself: a search hit lies elsewhere
                                 PostMessageW(h, WM_APP, 0, 0); // reload after the edit control is gone
                             }
                         }
@@ -1202,6 +1318,7 @@ fn main() {
         let inst = GetModuleHandleW(ptr::null());
         let cls = w("RustExplorer");
         let desktop = env::args().nth(1).as_deref() == Some("--desktop");
+        TABS.store(config::flag("explorer.tabs"), Relaxed);
         // desktop without a wallpaper file shows black, not window white
         let bg = if desktop { GetStockObject(BLACK_BRUSH) as _ } else { windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(ui::pal().bg) };
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(ui::proc), hInstance: inst, lpszClassName: w("RxChrome").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
@@ -1258,6 +1375,16 @@ mod tests {
         let mut v = vec![r("C:\\z\\b.txt", false, 1, 1), r("D:\\a\\a.txt", false, 1, 1)];
         sort_rows(&mut v, 0, true);
         assert_eq!(names(&v), ["D:\\a\\a.txt", "C:\\z\\b.txt"]);
+    }
+
+    #[test]
+    fn switching_tabs_off_keeps_the_active_one() {
+        let (mut tabs, mut active): (Vec<PathBuf>, usize) = (vec!["a".into(), "b".into(), "c".into()], 1);
+        keep_active(&mut tabs, &mut active);
+        assert_eq!((tabs, active), (vec![PathBuf::from("b")], 0));
+        let (mut one, mut a): (Vec<PathBuf>, usize) = (vec!["x".into()], 0);
+        keep_active(&mut one, &mut a);
+        assert_eq!((one, a), (vec![PathBuf::from("x")], 0));
     }
 
     #[test]

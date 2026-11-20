@@ -14,6 +14,9 @@ pub fn pill() -> u32 { mix(pal().bg, 0, 0.35) }
 pub fn off() -> u32 { mix(pal().dim, pal().bg, 0.45) }
 
 pub const CHROME_H: i32 = 88;
+const TABS_H: i32 = 36; // the tab strip's share of it
+/// Height of the top part: without tabs (explorer.tabs = 0) the strip is not there and the toolbar sits at the top.
+pub fn chrome_h() -> i32 { sc(if tabs_on() { CHROME_H } else { CHROME_H - TABS_H }) }
 pub const STATUS_H: i32 = 26;
 pub const WM_UI: u32 = WM_APP + 4; // chrome -> window: wp = action (see Hit), lp = tab index
 const WM_MOUSELEAVE: u32 = 0x02A3; // not exported under the enabled features
@@ -327,6 +330,12 @@ unsafe extern "system" fn list_sub(h: HWND, m: u32, wp: WPARAM, lp: LPARAM, _id:
         }
     } else if m == WM_MOUSELEAVE {
         redraw_row(h, ROWHOT.replace(-1));
+    } else if m == WM_MBUTTONUP {
+        // middle click on a folder: a new tab (the window decides, see WM_UI 22)
+        let mut ht: LVHITTESTINFO = std::mem::zeroed();
+        ht.pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+        let i = SendMessageW(h, LVM_HITTEST, 0, &mut ht as *mut _ as isize);
+        if i >= 0 { PostMessageW(GetParent(h), WM_UI, 22, i); }
     } else if m == WM_SETFOCUS || m == WM_KILLFOCUS {
         InvalidateRect(h, ptr::null(), 0); // the selection is accent-coloured only while the list has the focus
     }
@@ -377,14 +386,18 @@ struct Layout { tabs: Vec<RECT>, close: Vec<RECT>, plus: RECT, back: RECT, fwd: 
 
 fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT { RECT { left: l, top: t, right: r, bottom: b } }
 
-fn layout(cw: i32, n: usize) -> Layout {
+/// Where everything in the top part is, for `n` tabs. `strip` false (tabs switched off): no tabs and no "+", and the
+/// toolbar row takes the strip's place.
+fn layout(cw: i32, n: usize, strip: bool) -> Layout {
+    let n = if strip { n } else { 0 };
     let (ty0, ty1) = (sc(8), sc(36));
     let tw = ((cw - sc(12) * 2 - sc(36)) / n.max(1) as i32 - sc(4)).clamp(sc(90), sc(220));
     let tabs: Vec<RECT> = (0..n as i32).map(|i| { let l = sc(12) + i * (tw + sc(4)); rc(l, ty0, l + tw, ty1) }).collect();
     let close = tabs.iter().map(|t| rc(t.right - sc(26), (t.top + t.bottom) / 2 - sc(10), t.right - sc(6), (t.top + t.bottom) / 2 + sc(10))).collect();
     let px = tabs.last().map_or(sc(12), |t| t.right + sc(4));
-    let plus = rc(px, ty0 + sc(2), px + sc(26), ty1 - sc(2));
-    let (by0, by1, bs) = (sc(44), sc(80), sc(36));
+    let plus = if strip { rc(px, ty0 + sc(2), px + sc(26), ty1 - sc(2)) } else { rc(0, 0, 0, 0) };
+    let up = if strip { 0 } else { sc(TABS_H) };
+    let (by0, by1, bs) = (sc(44) - up, sc(80) - up, sc(36));
     let btn = |i: i32| rc(sc(12) + i * (bs + sc(4)), by0, sc(12) + i * (bs + sc(4)) + bs, by1);
     let view = rc(cw - sc(12) - bs, by0, cw - sc(12), by1);
     let search = rc(view.left - sc(4) - bs, by0, view.left - sc(4), by1);
@@ -411,7 +424,7 @@ pub fn place_edit(chrome: HWND) {
         if edit.is_null() { return; }
         let mut r: RECT = std::mem::zeroed();
         GetClientRect(chrome, &mut r);
-        let p = layout(r.right, 1).pill;
+        let p = layout(r.right, 1, tabs_on()).pill;
         let eh = sc(20);
         MoveWindow(edit, p.left + sc(40), (p.top + p.bottom - eh) / 2, (p.right - p.left - sc(40) - sc(16)).max(0), eh, 1);
         if GetFocus() != edit { ShowWindow(edit, SW_HIDE); } // the path parts are painted instead until the pill is clicked
@@ -494,7 +507,8 @@ unsafe fn paint_chrome(hwnd: HWND) {
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
     SetBkMode(dc, TRANSPARENT as i32);
-    let l = layout(cr.right, labels.len());
+    let strip = tabs_on();
+    let l = layout(cr.right, labels.len(), strip);
     let hot = HOT.get();
     let (f_txt, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(16, 400, "Segoe MDL2 Assets") as HFONT, font(12, 400, "Segoe MDL2 Assets") as HFONT);
     let of = SelectObject(dc, f_txt);
@@ -515,9 +529,11 @@ unsafe fn paint_chrome(hwnd: HWND) {
             text(dc, "\u{E711}", c, mix(pal().dim, pal().text, if hot == CLOSE + i as i32 { 1.0 } else { 0.4 }), DT_CENTER);
         }
     }
-    glow(dc, PLUS, l.plus, pal().bg, pal().hover, sc(6), hot == PLUS);
-    SelectObject(dc, f_small);
-    text(dc, "\u{E710}", l.plus, pal().dim, DT_CENTER);
+    if strip {
+        glow(dc, PLUS, l.plus, pal().bg, pal().hover, sc(6), hot == PLUS);
+        SelectObject(dc, f_small);
+        text(dc, "\u{E710}", l.plus, pal().dim, DT_CENTER);
+    }
 
     // toolbar buttons
     SelectObject(dc, f_glyph);
@@ -642,7 +658,7 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
     let layout_now = || {
         let mut r: RECT = std::mem::zeroed();
         GetClientRect(h, &mut r);
-        layout(r.right, ST.with(|c| c.try_borrow().map_or(1, |s| s.tabs.len())))
+        layout(r.right, ST.with(|c| c.try_borrow().map_or(1, |s| s.tabs.len())), tabs_on())
     };
     match m {
         WM_PAINT => paint_chrome(h),
@@ -684,6 +700,12 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             };
             PostMessageW(GetParent(h), WM_UI, act, idx);
         }
+        WM_RBUTTONUP => {
+            // the tabs' menu (new / close, tabs on or off); the address pill keeps the right click for its own use
+            let l = layout_now();
+            let tab = match hit(&l, x, y) { k if (TAB..CLOSE).contains(&k) => (k - TAB) as isize, k if (CLOSE..CRUMB).contains(&k) => (k - CLOSE) as isize, _ => -1 };
+            if !inside(&l.pill, x, y) { PostMessageW(GetParent(h), WM_UI, 30, tab); }
+        }
         WM_COMMAND if (wp >> 16) == 0x0100 || (wp >> 16) == 0x0200 => {
             // edit got / lost focus: shown only while typing (the path parts otherwise), outline colour
             ShowWindow(lp as HWND, if (wp >> 16) == 0x0100 { SW_SHOW } else { SW_HIDE });
@@ -703,7 +725,8 @@ pub unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
 }
 
 
-// ---------- navigation pane (left): quick access folders and the drives, like Explorer's ----------
+// ---------- navigation pane (left): our Quick access folders (quick.rs) and the drives, like Explorer's ----------
+// shortcut: the pane does not scroll; a very long Quick access list runs off its bottom edge.
 
 pub const NAV_W: i32 = 232;
 const NAV_ROW: i32 = 34;
@@ -725,14 +748,20 @@ thread_local! {
 
 pub fn nav_init(h: HWND) {
     NAVWND.set(h as isize);
-    let home = PathBuf::from(env::var_os("USERPROFILE").unwrap_or_default());
+    nav_fill();
+}
+
+/// (Re)builds the pane: our Quick access list as it is on disk (pinned folders are not checked for existence: a dead
+/// network path would stall the window), then the drives.
+pub fn nav_fill() {
+    let home = env::var("USERPROFILE").unwrap_or_default();
     let head = |t: &str| NavItem { title: t.into(), path: PathBuf::new(), glyph: "", cap: None };
-    let mut v = vec![head("Quick access"), NavItem { title: "Home".into(), path: home.clone(), glyph: "\u{E80F}", cap: None }];
-    for (t, sub, g) in [("Desktop", "Desktop", "\u{E7F4}"), ("Downloads", "Downloads", "\u{E896}"), ("Documents", "Documents", "\u{E8A5}"), ("Pictures", "Pictures", "\u{E91B}"), ("Music", "Music", "\u{E8D6}"), ("Videos", "Videos", "\u{E714}")] {
-        let p = home.join(sub);
-        if p.is_dir() { v.push(NavItem { title: t.into(), path: p, glyph: g, cap: None }); }
+    let mut v = vec![head(t!("Быстрый доступ", "Quick access"))];
+    for p in quick::load() {
+        let (title, glyph) = quick::look(&p, &home);
+        v.push(NavItem { title, path: PathBuf::from(p), glyph, cap: None });
     }
-    v.push(head("This PC"));
+    v.push(head(t!("Этот компьютер", "This PC")));
     unsafe {
         use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
         let mask = GetLogicalDrives();
@@ -751,6 +780,7 @@ pub fn nav_init(h: HWND) {
         }
     }
     NAV.with_borrow_mut(|n| *n = v);
+    nav_dirty();
 }
 
 pub fn nav_path(i: usize) -> Option<PathBuf> {
@@ -766,7 +796,7 @@ pub fn nav_dirty() {
 pub unsafe fn layout_children(cw: i32, ch: i32) {
     let (chrome, list) = ST.with(|c| c.try_borrow().map_or((ptr::null_mut(), ptr::null_mut()), |s| (s.tab, s.list)));
     let nav = NAVWND.get() as HWND;
-    let (top, status) = (sc(CHROME_H), sc(STATUS_H));
+    let (top, status) = (chrome_h(), sc(STATUS_H));
     let nw = if cw > sc(760) { sc(NAV_W) } else { 0 };
     let h = (ch - top - status).max(0);
     MoveWindow(chrome, 0, 0, cw, top, 1);
@@ -871,7 +901,28 @@ pub unsafe extern "system" fn nav_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
                 PostMessageW(GetParent(h), WM_UI, 20, i as isize);
             }
         }
+        WM_RBUTTONUP => { PostMessageW(GetParent(h), WM_UI, 23, nav_hit(y).map_or(-1, |i| i as isize)); } // pin / unpin / reorder
         _ => return DefWindowProcW(h, m, wp, lp),
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_tabs_the_strip_is_gone_and_the_toolbar_moves_up() {
+        let on = layout(1000, 3, true);
+        assert_eq!(on.tabs.len(), 3);
+        assert_eq!((on.back.top, on.back.bottom), (44, 80)); // under the tab strip
+        assert_eq!(hit(&on, on.plus.left + 1, on.plus.top + 1), PLUS);
+        let off = layout(1000, 3, false);
+        assert!(off.tabs.is_empty() && off.close.is_empty());
+        assert_eq!((off.back.top, off.back.bottom), (8, 44)); // where the strip was
+        assert_eq!((off.pill.left, off.pill.right), (on.pill.left, on.pill.right)); // the row itself is the same
+        assert_eq!(off.pill.bottom + 8, CHROME_H - TABS_H); // and fits the shorter top part
+        // nothing left to click that would make or pick a tab
+        assert!((0..1000).step_by(7).all(|x| (0..CHROME_H).all(|y| { let k = hit(&off, x, y); k != PLUS && k < TAB })));
+    }
 }
